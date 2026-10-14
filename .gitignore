@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+datasets/
+runs/
+snapshots/
+.derbake/
+decorated_derbake/

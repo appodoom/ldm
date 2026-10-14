@@ -1,0 +1,100 @@
+"""Local preparation, training, snapshot, and validation commands."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def _prepare(args):
+    from .dataset_ldm import prepare_dataset
+    result = prepare_dataset(args.ordinary, args.output, variant=args.variant,
+                             context_size=args.context_size,
+                             max_beats_per_cycle=args.max_beats_per_cycle,
+                             decorated_dir=args.decorated, stride=args.stride,
+                             decorated_weight=args.decorated_weight)
+    print(json.dumps(result["stats"], indent=2))
+
+
+def _train(args):
+    from .configuration_ldm import LDMConfig
+    from .train_ldm import train
+    from .vocabulary import atomic_vocabulary, vocabulary_hash
+    manifest = json.loads((args.dataset / "dataset_manifest.json").read_text(encoding="utf-8"))
+    vocab = atomic_vocabulary(manifest["variant"])
+    maxima = {key: max(int(value[key]) for value in manifest["stats"].values())
+              for key in ("max_tokens_per_beat", "max_beat_slots_per_chunk", "max_cycles_per_chunk")}
+    config = LDMConfig(vocab_size=len(vocab), vocab_hash=vocabulary_hash(vocab),
+                       dataset_variant=manifest["variant"], context_size=manifest["context_size"],
+                       max_beats_per_cycle=manifest["max_beats_per_cycle"],
+                       number_of_layers=args.layers, number_of_heads=args.heads,
+                       number_of_embeddings=args.embeddings, mlp_ratio=args.mlp_ratio,
+                       dropout=args.dropout, attention_layout=args.attention_layout,
+                       **maxima)
+    result = train(args.dataset, args.run, config, epochs=args.epochs,
+                   batch_size=args.batch_size, learning_rate=args.learning_rate,
+                   seed=args.seed, save_every_steps=args.save_every_steps,
+                   resume=args.resume, device=args.device)
+    print(json.dumps(result, indent=2))
+
+
+def _snapshot(args):
+    from .hub_ldm import build_local_snapshot
+    print(json.dumps(build_local_snapshot(args.run, args.output), indent=2))
+
+
+def _validate(args):
+    script = Path(__file__).resolve().parent.parent / "tests" / "hf_snapshot_smoke.py"
+    with tempfile.TemporaryDirectory() as folder:
+        command = [sys.executable, "-I", str(script), str(args.snapshot.resolve())]
+        subprocess.run(command, check=True, cwd=folder)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="python -m ldm.cli")
+    commands = parser.add_subparsers(dest="command", required=True)
+    prepare = commands.add_parser("prepare")
+    prepare.add_argument("--ordinary", type=Path, required=True)
+    prepare.add_argument("--decorated", type=Path)
+    prepare.add_argument("--output", type=Path, required=True)
+    prepare.add_argument("--variant", choices=("with_subd", "no_subd"), required=True)
+    prepare.add_argument("--context-size", type=int, default=1024)
+    prepare.add_argument("--max-beats-per-cycle", type=int, default=16)
+    prepare.add_argument("--stride", type=int)
+    prepare.add_argument("--decorated-weight", type=float, default=1.0)
+    prepare.set_defaults(run=_prepare)
+    training = commands.add_parser("train")
+    training.add_argument("--dataset", type=Path, required=True)
+    training.add_argument("--run", type=Path, required=True)
+    training.add_argument("--epochs", type=int, default=10)
+    training.add_argument("--batch-size", type=int, default=4)
+    training.add_argument("--learning-rate", type=float, default=3e-4)
+    training.add_argument("--layers", type=int, default=4)
+    training.add_argument("--heads", type=int, default=4)
+    training.add_argument("--embeddings", type=int, default=256)
+    training.add_argument("--mlp-ratio", type=int, default=4)
+    training.add_argument("--dropout", type=float, default=0.1)
+    training.add_argument("--attention-layout", choices=("global", "alternating_global_structured"),
+                          default="alternating_global_structured")
+    training.add_argument("--seed", type=int, default=1337)
+    training.add_argument("--save-every-steps", type=int, default=200)
+    training.add_argument("--device")
+    training.add_argument("--resume", action="store_true")
+    training.set_defaults(run=_train)
+    snapshot = commands.add_parser("snapshot")
+    snapshot.add_argument("--run", type=Path, required=True)
+    snapshot.add_argument("--output", type=Path, required=True)
+    snapshot.set_defaults(run=_snapshot)
+    validation = commands.add_parser("validate")
+    validation.add_argument("--snapshot", type=Path, required=True)
+    validation.set_defaults(run=_validate)
+    args = parser.parse_args(argv)
+    args.run(args)
+
+
+if __name__ == "__main__":
+    main()
