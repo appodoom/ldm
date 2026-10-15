@@ -9,7 +9,7 @@ upload a production model automatically.
 - `ldm/`: one shared model core, rhythm codec and schemas, training, and HF classes.
 - `migrate_derbake.py`: conversion of four-line source files to five-line copies.
 - `tests/`: format, grammar, split, and recovery contracts.
-- `notebooks/`: a Colab orchestration notebook that imports this package.
+- `notebooks/`: the full Colab training, review, upload, and remote validation notebook.
 
 The converted corpora, prepared arrays, runs, and snapshots are ignored by Git.
 The paired five-line corpus is in the private
@@ -19,8 +19,7 @@ under `five-line/normal` and `five-line/decorated`.
 ## Environment
 
 The package requires Python 3.10 or newer and a supported PyTorch installation.
-Run the notebook tests on the chosen Colab runtime before training; Python 3.13
-has not yet been validated for this project.
+Run the notebook tests on the chosen Colab runtime before training.
 The GitHub repository and HF dataset are private, so authenticate to both
 services in a fresh Colab session. Clone
 `https://github.com/appodoom/ldm.git` into `/content/ldm` before opening its
@@ -32,10 +31,10 @@ python -m unittest discover -s tests -v
 ```
 
 The package pins Transformers 4.51.3 for its custom AutoClass integration.
-In the development workspace, pure Python contracts, all converted corpus round
-trips, and both complete dataset preparations passed. Model training and HF
-snapshot commands still need validation on a machine with PyTorch and
-Transformers before any release is published.
+Pure Python contracts, all converted corpus round trips, and both complete
+dataset preparations passed locally. A one-epoch `with_subd` run and isolated
+HF snapshot validation passed in a Python 3.13 Colab session. Production training,
+`no_subd` runtime validation, generation review, and remote Hub validation remain.
 
 ## Prepare a dataset
 

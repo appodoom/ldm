@@ -32,6 +32,15 @@ class CliDispatchTests(unittest.TestCase):
 
 
 class DerbakeContractTests(unittest.TestCase):
+    def test_invalid_atom_ids_and_subdivisions_are_rejected(self):
+        vocab = AtomicVocabulary(atomic_vocabulary("with_subd"))
+        with self.assertRaises(ValueError):
+            vocab.decode([-1])
+        schema = RhythmSchema("with_subd", 16)
+        for subd in ("SUBD_0", "SUBD_01", "SUBD_9"):
+            with self.subTest(subd=subd), self.assertRaises(ValueError):
+                schema.decode(["<SOC>", "<SOB>", subd, "HIT_D", "<EOB>", "<EOC>"])
+
     def test_writer_round_trip_both_variants(self):
         rhythm = RhythmSequence(((Beat(2, ("HIT_D", "HIT_S")),),
                                  (Beat(4, ("HIT_S", "HIT_OTA_decorated", "HIT_S", "HIT_PA2")),

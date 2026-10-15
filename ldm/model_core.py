@@ -1160,6 +1160,9 @@ class GPT(nn.Module):
             self.attention_layout, number_of_layers
         )
         self.has_structured_layers = "structured" in self.resolved_attention_layout
+        self.max_tokens_per_beat = int(max_tokens_per_beat or 0)
+        self.max_beat_slots_per_chunk = int(max_beat_slots_per_chunk or 0)
+        self.max_cycles_per_chunk = int(max_cycles_per_chunk or 0)
         if self.has_structured_layers:
             if self.position_encoding != "rope":
                 raise ValueError(
@@ -1361,14 +1364,13 @@ class GPT(nn.Module):
             ].unsqueeze(0)
         return self.dropout(base + positional + self.beat_idx_embeddings(beat_idx_ids))
 
-    @staticmethod
-    def _prepare_routing(routing, device):
+    def _prepare_routing(self, routing, device):
         if routing is None:
             return None
         missing = [field for field in STRUCTURED_ROUTING_FIELDS if field not in routing]
         if missing:
             raise KeyError(f"Structured routing is missing fields: {missing}")
-        return {
+        prepared = {
             field: routing[field].to(
                 device=device,
                 dtype=torch.bool if field.endswith("_mask") else torch.long,
@@ -1376,6 +1378,14 @@ class GPT(nn.Module):
             )
             for field in STRUCTURED_ROUTING_FIELDS
         }
+        for field, limit in (
+            ("beat_slot", self.max_beat_slots_per_chunk),
+            ("cycle_slot", self.max_cycles_per_chunk),
+            ("local_beat_position", self.max_tokens_per_beat),
+        ):
+            if torch.any(prepared[field] >= limit):
+                raise ValueError(f"Structured {field} exceeds model capacity {limit}")
+        return prepared
 
     def forward(
         self,
@@ -1484,6 +1494,13 @@ class GPT(nn.Module):
                 key: value.to(batch_of_token_ids.device, non_blocking=True)
                 for key, value in structured_step.items()
             }
+            for field, limit in (
+                ("cycle_ordinal", self.max_cycles_per_chunk),
+                ("beat_index_in_cycle", self.max_beats_per_cycle),
+                ("local_beat_position", self.max_tokens_per_beat),
+            ):
+                if torch.any(structured_step[field] >= limit):
+                    raise ValueError(f"Structured {field} exceeds model capacity {limit}")
         x = self._embed_tokens(
             batch_of_token_ids, beat_idx_ids, beat_pos_ids, position
         )

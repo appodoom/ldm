@@ -42,7 +42,10 @@ class AtomicVocabulary:
             raise ValueError(f"Unknown atomic token: {exc.args[0]}") from exc
 
     def decode(self, ids: list[int]) -> list[str]:
-        try:
-            return [self.tokens[int(i)] for i in ids]
-        except IndexError as exc:
-            raise ValueError("Token ID outside vocabulary") from exc
+        result = []
+        for raw_id in ids:
+            index = int(raw_id)
+            if index < 0 or index >= len(self.tokens):
+                raise ValueError("Token ID outside vocabulary")
+            result.append(self.tokens[index])
+        return result

@@ -58,6 +58,8 @@ def build_local_snapshot(run_dir: str | Path, output_dir: str | Path) -> dict:
         encoding="utf-8")
     (metadata / "release_manifest.json").write_text(json.dumps(payload, indent=2) + "\n",
                                                     encoding="utf-8")
+    repo_id = {"with_subd": "Appodoom/ldm-with-subd",
+               "no_subd": "Appodoom/ldm-no-subd"}[config.dataset_variant]
     (output_dir / "README.md").write_text(
         f"""---
 library_name: transformers
@@ -70,13 +72,13 @@ tags:
 
 This snapshot uses atomic rhythm tokens and five-line `.derbake` files.
 It was built from a selected training checkpoint. `trust_remote_code=True`
-executes the pinned model/processor code in this repository.
+executes the model/processor code from the selected repository revision.
 
 ```python
 from transformers import AutoModel, AutoProcessor
 
-repo_id = "REPLACE_WITH_REPOSITORY_ID"
-revision = "REPLACE_WITH_IMMUTABLE_COMMIT"
+repo_id = "{repo_id}"
+revision = "main"  # Replace with the verified release commit SHA for reproducibility.
 processor = AutoProcessor.from_pretrained(repo_id, revision=revision, trust_remote_code=True)
 model = AutoModel.from_pretrained(repo_id, revision=revision, trust_remote_code=True).eval()
 inputs = processor(derbake_path="prompt.derbake", return_tensors="pt")

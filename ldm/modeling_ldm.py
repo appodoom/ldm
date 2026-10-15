@@ -95,6 +95,8 @@ class LDMModel(PreTrainedModel):
             raise ValueError("Prompt length exceeds model context")
         schema = RhythmSchema(self.config.dataset_variant, self.config.max_beats_per_cycle)
         prompt_ids = input_ids[0].tolist()
+        if any(index < 0 or index >= len(self.vocab) for index in prompt_ids):
+            raise ValueError("Prompt contains a token ID outside the vocabulary")
         try:
             schema.decode([self.vocab[index] for index in prompt_ids])
         except (IndexError, ValueError) as exc:

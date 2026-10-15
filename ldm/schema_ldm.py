@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from .derbake_ldm import Beat, HITS, RhythmSequence
+from .derbake_ldm import Beat, HITS, MAX_SUBDIVISION, RhythmSequence
+
+
+_SUBDIVISIONS = {f"SUBD_{size}": size for size in range(1, MAX_SUBDIVISION + 1)}
 
 
 class RhythmSchema:
@@ -43,12 +46,9 @@ class RhythmSchema:
                 i += 1
                 subdivision = None
                 if self.variant == "with_subd":
-                    if i >= len(atoms) or not atoms[i].startswith("SUBD_"):
-                        raise ValueError("Explicit subdivision is missing")
-                    try:
-                        subdivision = int(atoms[i][5:])
-                    except ValueError as exc:
-                        raise ValueError("Invalid subdivision") from exc
+                    if i >= len(atoms) or atoms[i] not in _SUBDIVISIONS:
+                        raise ValueError("Valid explicit subdivision is missing")
+                    subdivision = _SUBDIVISIONS[atoms[i]]
                     i += 1
                 hits = []
                 while i < len(atoms) and atoms[i] in HITS:
@@ -57,7 +57,7 @@ class RhythmSchema:
                 if i >= len(atoms) or atoms[i] != "<EOB>":
                     raise ValueError("Beat is missing <EOB> or contains an invalid atom")
                 i += 1
-                beats.append(Beat(subdivision or len(hits), tuple(hits)))
+                beats.append(Beat(subdivision if subdivision is not None else len(hits), tuple(hits)))
                 if len(beats) > self.max_beats_per_cycle:
                     raise ValueError("Cycle exceeds model capacity")
             if i >= len(atoms) or not beats:
