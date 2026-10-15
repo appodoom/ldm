@@ -12,8 +12,10 @@ from transformers.modeling_outputs import CausalLMOutput
 
 from .configuration_ldm import LDMConfig
 from .cycle_collector import IncompleteGenerationError
+from .derbake_ldm import RhythmSequence  # HF caches only direct relative imports.
 from .generation_ldm import generate_continuation_ids
 from .model_core import GPT
+from .rhythm_ldm import STRUCTURED_ROUTING_FIELDS  # Needed by model_core/generation_ldm.
 from .schema_ldm import RhythmSchema
 from .vocabulary import atomic_vocabulary, vocabulary_hash
 

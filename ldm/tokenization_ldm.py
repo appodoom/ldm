@@ -7,6 +7,7 @@ from pathlib import Path
 
 from transformers import PreTrainedTokenizer
 
+from .derbake_ldm import HITS  # HF caches only direct relative imports.
 from .vocabulary import AtomicVocabulary, vocabulary_hash
 
 

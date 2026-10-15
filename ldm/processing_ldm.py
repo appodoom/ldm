@@ -12,6 +12,7 @@ from transformers.utils.hub import cached_file
 from .derbake_ldm import RhythmSequence, parse_derbake, write_derbake
 from .schema_ldm import RhythmSchema
 from .tokenization_ldm import LDMTokenizer
+from .vocabulary import AtomicVocabulary  # HF caches only direct relative imports.
 
 
 class LDMDerbakeProcessor(ProcessorMixin):
