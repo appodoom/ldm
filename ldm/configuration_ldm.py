@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 
 
-class LDMConfig(PreTrainedConfig):
+class LDMConfig(PretrainedConfig):
     model_type = "ldm_rhythm"
 
     def __init__(
