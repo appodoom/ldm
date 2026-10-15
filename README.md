@@ -20,7 +20,8 @@ under `five-line/normal` and `five-line/decorated`.
 
 Use Python 3.10–3.12 on a machine with a supported PyTorch installation.
 The GitHub repository and HF dataset are private, so authenticate to both
-services in a fresh Colab session. Clone this repository before opening its
+services in a fresh Colab session. Clone
+`https://github.com/appodoom/ldm.git` into `/content/ldm` before opening its
 notebook. Install this package from the checkout:
 
 ```bash
