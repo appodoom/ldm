@@ -18,7 +18,9 @@ under `five-line/normal` and `five-line/decorated`.
 
 ## Environment
 
-Use Python 3.10–3.12 on a machine with a supported PyTorch installation.
+The package requires Python 3.10 or newer and a supported PyTorch installation.
+Run the notebook tests on the chosen Colab runtime before training; Python 3.13
+has not yet been validated for this project.
 The GitHub repository and HF dataset are private, so authenticate to both
 services in a fresh Colab session. Clone
 `https://github.com/appodoom/ldm.git` into `/content/ldm` before opening its
