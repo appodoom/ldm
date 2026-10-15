@@ -21,8 +21,10 @@ class CliDispatchTests(unittest.TestCase):
     def test_run_path_does_not_shadow_command_handler(self):
         run = Path("runs/example")
         with patch.object(cli, "_train") as training:
-            cli.main(["train", "--dataset", "datasets/example", "--run", str(run)])
+            cli.main(["train", "--dataset", "datasets/example", "--run", str(run),
+                      "--log-every-steps", "25"])
         self.assertEqual(training.call_args.args[0].run, run)
+        self.assertEqual(training.call_args.args[0].log_every_steps, 25)
 
         with patch.object(cli, "_snapshot") as snapshot:
             cli.main(["snapshot", "--run", str(run), "--output", "snapshots/example"])

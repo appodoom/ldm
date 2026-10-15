@@ -85,6 +85,9 @@ python -m ldm.cli train --dataset datasets/with_subd --run runs/with_subd \
 `last.pt` contains optimizer, scaler, RNG, and epoch/batch position for resume;
 `best.pt` contains the selected weights and model configuration. Continue with
 `--resume`. The run also stores its config and dataset reference for promotion.
+Training prints live loss every 50 optimizer steps, checkpoint saves, and
+validation loss at each epoch end. Change the interval with
+`--log-every-steps N`; use `python -u -m ldm.cli train ...` in Colab to stream it.
 New atomic models start from fresh weights; historic notebook
 checkpoints are not silently reindexed.
 

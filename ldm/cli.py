@@ -38,6 +38,7 @@ def _train(args):
     result = train(args.dataset, args.run, config, epochs=args.epochs,
                    batch_size=args.batch_size, learning_rate=args.learning_rate,
                    seed=args.seed, save_every_steps=args.save_every_steps,
+                   log_every_steps=args.log_every_steps,
                    resume=args.resume, device=args.device)
     print(json.dumps(result, indent=2))
 
@@ -82,6 +83,7 @@ def main(argv=None):
                           default="alternating_global_structured")
     training.add_argument("--seed", type=int, default=1337)
     training.add_argument("--save-every-steps", type=int, default=200)
+    training.add_argument("--log-every-steps", type=int, default=50)
     training.add_argument("--device")
     training.add_argument("--resume", action="store_true")
     training.set_defaults(handler=_train)

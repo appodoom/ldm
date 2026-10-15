@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -92,7 +93,7 @@ def evaluate(model: LDMModel, dataset: ChunkDataset, batch_size: int, device: to
 
 def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
           epochs: int, batch_size: int, learning_rate: float, seed: int = 1337,
-          save_every_steps: int = 200, resume: bool = False,
+          save_every_steps: int = 200, log_every_steps: int = 50, resume: bool = False,
           device: str | None = None) -> dict:
     dataset_dir = Path(dataset_dir)
     run_dir = Path(run_dir)
@@ -103,7 +104,7 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
     fingerprint = hashlib.sha256(manifest_bytes).hexdigest()
     if manifest["variant"] != config.dataset_variant or manifest["vocab_hash"] != config.vocab_hash:
         raise ValueError("Dataset variant/vocabulary differs from model config")
-    if min(epochs, batch_size, save_every_steps) < 1 or learning_rate <= 0:
+    if min(epochs, batch_size, save_every_steps, log_every_steps) < 1 or learning_rate <= 0:
         raise ValueError("Training counts and learning rate must be positive")
     run_config = {"dataset_fingerprint": fingerprint, "model_config": config.to_dict(),
                   "batch_size": batch_size, "learning_rate": learning_rate,
@@ -155,7 +156,14 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
         epoch_start, batch_start, step = checkpoint["epoch"], checkpoint["batch"], checkpoint["step"]
         best = checkpoint["best_val_loss"]
         history = checkpoint["history"]
+    print(f"Training {config.dataset_variant} on {device}: "
+          f"{len(train_data)} train, {len(val_data)} validation, "
+          f"{len(test_data)} test chunks; target {epochs} epochs", flush=True)
+    if resume:
+        print(f"Resuming at epoch {epoch_start + 1}, batch {batch_start + 1}, "
+              f"global step {step}", flush=True)
     for epoch in range(epoch_start, epochs):
+        epoch_started = time.perf_counter()
         generator = torch.Generator().manual_seed(seed + epoch)
         decorated_weight = manifest.get("decorated_weight") or 1.0
         if decorated_weight == 1.0:
@@ -166,10 +174,14 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
             order = torch.multinomial(weights, len(train_data), replacement=True,
                                       generator=generator).tolist()
         batches = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
+        print(f"Epoch {epoch + 1}/{epochs}: {len(batches)} batches", flush=True)
+        logged_loss = 0.0
+        logged_targets = 0
         for batch_number in range(batch_start if epoch == epoch_start else 0, len(batches)):
             model.train()
             batch = train_data.batch(batches[batch_number], device)
-            if not (batch["labels"] != -100).any():
+            target_count = int((batch["labels"] != -100).sum().item())
+            if not target_count:
                 continue
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
@@ -178,26 +190,42 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
             scaler.step(optimizer)
             scaler.update()
             step += 1
+            logged_loss += float(loss.detach().item()) * target_count
+            logged_targets += target_count
+            if step % log_every_steps == 0 or batch_number + 1 == len(batches):
+                print(f"Epoch {epoch + 1}/{epochs} batch {batch_number + 1}/{len(batches)} "
+                      f"step {step} | train loss {logged_loss / logged_targets:.4f} "
+                      f"| elapsed {time.perf_counter() - epoch_started:.0f}s", flush=True)
+                logged_loss = 0.0
+                logged_targets = 0
             if step % save_every_steps == 0:
                 _save(checkpoint_path, {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
                     "scaler": scaler.state_dict(), "rng": _rng_state(), "config": config.to_dict(),
                     "dataset_fingerprint": fingerprint, "epoch": epoch, "batch": batch_number + 1,
                     "step": step, "best_val_loss": best, "history": history})
+                print(f"Saved resume checkpoint at step {step}", flush=True)
         batch_start = 0
+        print(f"Epoch {epoch + 1}/{epochs}: validating...", flush=True)
         val_loss = evaluate(model, val_data, batch_size, device)
         history.append({"epoch": epoch + 1, "val_loss": val_loss})
         if val_loss < best:
             best = val_loss
             _save(run_dir / "best.pt", {"model": model.state_dict(), "config": config.to_dict(),
                 "dataset_fingerprint": fingerprint, "epoch": epoch + 1, "val_loss": val_loss})
+            print(f"Saved best checkpoint (validation loss {val_loss:.4f})", flush=True)
         _save(checkpoint_path, {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(), "rng": _rng_state(), "config": config.to_dict(),
             "dataset_fingerprint": fingerprint, "epoch": epoch + 1, "batch": 0,
             "step": step, "best_val_loss": best, "history": history})
+        print(f"Epoch {epoch + 1}/{epochs} complete | val loss {val_loss:.4f} "
+              f"| best {best:.4f} | elapsed {time.perf_counter() - epoch_started:.0f}s",
+              flush=True)
+    print("Evaluating best checkpoint on test split...", flush=True)
     best_checkpoint = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
     model.load_state_dict(best_checkpoint["model"], strict=True)
     test_loss = evaluate(model, test_data, batch_size, device)
     result = {"dataset_fingerprint": fingerprint, "best_val_loss": best,
               "test_loss": test_loss, "steps": step, "history": history}
     (run_dir / "metrics.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    print(f"Test loss {test_loss:.4f}; metrics saved to {run_dir / 'metrics.json'}", flush=True)
     return result
