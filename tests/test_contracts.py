@@ -5,14 +5,28 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 import numpy as np
 
+from ldm import cli
 from ldm.cycle_collector import CycleCollector, IncompleteGenerationError
 from ldm.derbake_ldm import Beat, RhythmSequence, parse_derbake, write_derbake
 from ldm.schema_ldm import RhythmSchema
 from ldm.splits import split_cycle_ranges
 from ldm.vocabulary import AtomicVocabulary, atomic_vocabulary
 from ldm.dataset_ldm import prepare_dataset
+
+
+class CliDispatchTests(unittest.TestCase):
+    def test_run_path_does_not_shadow_command_handler(self):
+        run = Path("runs/example")
+        with patch.object(cli, "_train") as training:
+            cli.main(["train", "--dataset", "datasets/example", "--run", str(run)])
+        self.assertEqual(training.call_args.args[0].run, run)
+
+        with patch.object(cli, "_snapshot") as snapshot:
+            cli.main(["snapshot", "--run", str(run), "--output", "snapshots/example"])
+        self.assertEqual(snapshot.call_args.args[0].run, run)
 
 
 class DerbakeContractTests(unittest.TestCase):
