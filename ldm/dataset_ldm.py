@@ -14,6 +14,35 @@ from .rhythm_ldm import (STRUCTURED_ROUTING_FIELDS, count_chunks, get_chunk_star
     compute_hierarchy_ids_for_sequence, build_structured_routing_for_window,
     build_target_ownership_masks_for_sequence)
 
+
+def skeleton_atom_mask(document, start_cycle: int, end_cycle: int, variant: str) -> list[bool]:
+    """Mark normalized HIT atoms sourced from line-four skeleton events."""
+    lengths = document.rhythm.cycle_lengths
+    first_beat = sum(lengths[:start_cycle])
+    last_beat = sum(lengths[:end_cycle])
+    event_slots = set()
+    flat_beats = [beat for cycle in document.rhythm.cycles for beat in cycle]
+    for event in document.skeleton_events:
+        beat_index = int(event.time_in_beats)
+        if first_beat <= beat_index < last_beat:
+            beat = flat_beats[beat_index]
+            slot = int((event.time_in_beats - beat_index) * beat.subdivision)
+            event_slots.add((beat_index, min(beat.subdivision - 1, max(0, slot))))
+    mask = []
+    beat_index = first_beat
+    for cycle in document.rhythm.cycles[start_cycle:end_cycle]:
+        mask.append(False)  # <SOC>
+        for beat in cycle:
+            mask.append(False)  # <SOB>
+            if variant == "with_subd":
+                mask.append(False)
+            for slot in range(beat.subdivision):
+                mask.append((beat_index, slot) in event_slots)
+            mask.append(False)  # <EOB>
+            beat_index += 1
+        mask.append(False)  # <EOC>
+    return mask
+
 def write_split_chunks(
     split_name: str,
     sequences: List[List[int]],
@@ -26,6 +55,8 @@ def write_split_chunks(
     max_beats_per_cycle: int,
     create_target_masks: bool = False,
     source_kinds: List[int] | None = None,
+    skeleton_targets: List[List[bool]] | None = None,
+    source_file_ids: List[int] | None = None,
     dtype=np.int32,
 ) -> Dict[str, int]:
     """Write token, rhythm, ownership, and structured-routing arrays."""
@@ -34,10 +65,12 @@ def write_split_chunks(
 
     out_path = out_dir / f"{split_name}.npy"
     kind_path = out_dir / f"{split_name}_source_kind.npy"
+    file_path = out_dir / f"{split_name}_source_file.npy"
     beat_idx_path = out_dir / f"{split_name}_beat_idx.npy"
     beat_pos_path = out_dir / f"{split_name}_beat_pos.npy"
     score_mask_path = out_dir / f"{split_name}_score_mask.npy"
     hit_count_mask_path = out_dir / f"{split_name}_hit_count_mask.npy"
+    skeleton_mask_path = out_dir / f"{split_name}_skeleton_mask.npy"
     routing_paths = {
         field: out_dir / f"{split_name}_{field}.npy"
         for field in STRUCTURED_ROUTING_FIELDS
@@ -50,6 +83,13 @@ def write_split_chunks(
         source_kinds = [0] * len(sequences)
     if len(source_kinds) != len(sequences):
         raise ValueError("Each sequence needs a source kind")
+    if source_file_ids is not None and len(source_file_ids) != len(sequences):
+        raise ValueError("Each sequence needs a source file ID")
+    if skeleton_targets is not None and (
+        len(skeleton_targets) != len(sequences)
+        or any(len(mask) != len(ids) for mask, ids in zip(skeleton_targets, sequences))
+    ):
+        raise ValueError("Skeleton target masks must match sequences")
     for ids in sequences:
         num_chunks = count_chunks(len(ids), window_len, stride, pad)
         parsed_files.append((ids, num_chunks))
@@ -61,6 +101,8 @@ def write_split_chunks(
         empty_bool = np.empty((0, window_len), dtype=bool)
         np.save(out_path, np.empty((0, window_len), dtype=dtype))
         np.save(kind_path, np.empty(0, dtype=np.uint8))
+        if source_file_ids is not None:
+            np.save(file_path, np.empty(0, dtype=np.int32))
         np.save(beat_idx_path, empty_int)
         np.save(beat_pos_path, empty_int)
         for field, path in routing_paths.items():
@@ -69,6 +111,8 @@ def write_split_chunks(
             empty_mask = np.empty((0, window_len - 1), dtype=bool)
             np.save(score_mask_path, empty_mask)
             np.save(hit_count_mask_path, empty_mask)
+            if skeleton_targets is not None:
+                np.save(skeleton_mask_path, empty_mask)
         return {
             "chunks": 0,
             "sequences_seen": len(sequences),
@@ -85,6 +129,8 @@ def write_split_chunks(
     arr = np.lib.format.open_memmap(out_path, mode="w+", dtype=dtype, shape=shape)
     kind_arr = np.lib.format.open_memmap(kind_path, mode="w+", dtype=np.uint8,
                                          shape=(total_chunks,))
+    file_arr = (np.lib.format.open_memmap(file_path, mode="w+", dtype=np.int32,
+                                         shape=(total_chunks,)) if source_file_ids is not None else None)
     beat_idx_arr = np.lib.format.open_memmap(
         beat_idx_path, mode="w+", dtype=np.int32, shape=shape
     )
@@ -103,6 +149,7 @@ def write_split_chunks(
 
     score_mask_arr = None
     hit_count_mask_arr = None
+    skeleton_mask_arr = None
     if create_target_masks:
         mask_shape = (total_chunks, window_len - 1)
         score_mask_arr = np.lib.format.open_memmap(
@@ -111,6 +158,10 @@ def write_split_chunks(
         hit_count_mask_arr = np.lib.format.open_memmap(
             hit_count_mask_path, mode="w+", dtype=bool, shape=mask_shape
         )
+        if skeleton_targets is not None:
+            skeleton_mask_arr = np.lib.format.open_memmap(
+                skeleton_mask_path, mode="w+", dtype=bool, shape=mask_shape
+            )
 
     row = 0
     unique_targets = 0
@@ -121,7 +172,7 @@ def write_split_chunks(
         "max_cycles_per_chunk": 0,
     }
 
-    for (ids, expected_chunks), source_kind in zip(parsed_files, source_kinds):
+    for file_index, ((ids, expected_chunks), source_kind) in enumerate(zip(parsed_files, source_kinds)):
         if expected_chunks == 0:
             continue
         seq_len = len(ids)
@@ -147,6 +198,8 @@ def write_split_chunks(
 
         for file_row, start in enumerate(chunk_starts):
             kind_arr[row] = source_kind
+            if file_arr is not None:
+                file_arr[row] = source_file_ids[file_index]
             real_end = min(start + window_len, seq_len)
             real_len = real_end - start
             chunk = np.full(window_len, pad_id, dtype=dtype)
@@ -171,6 +224,12 @@ def write_split_chunks(
             if create_target_masks:
                 score_mask_arr[row] = file_score_masks[file_row]
                 hit_count_mask_arr[row] = file_hit_count_masks[file_row]
+                if skeleton_mask_arr is not None:
+                    source_mask = np.asarray(skeleton_targets[file_index], dtype=bool)
+                    skeleton_window = np.zeros(window_len - 1, dtype=bool)
+                    segment = source_mask[start + 1:min(start + window_len, seq_len)]
+                    skeleton_window[:len(segment)] = segment
+                    skeleton_mask_arr[row] = file_score_masks[file_row] & skeleton_window
             row += 1
 
     if row != total_chunks:
@@ -179,6 +238,8 @@ def write_split_chunks(
         )
     arr.flush()
     kind_arr.flush()
+    if file_arr is not None:
+        file_arr.flush()
     beat_idx_arr.flush()
     beat_pos_arr.flush()
     for routing_array in routing_arrays.values():
@@ -186,6 +247,8 @@ def write_split_chunks(
     if create_target_masks:
         score_mask_arr.flush()
         hit_count_mask_arr.flush()
+        if skeleton_mask_arr is not None:
+            skeleton_mask_arr.flush()
 
     return {
         "chunks": total_chunks,
@@ -224,9 +287,11 @@ def prepare_dataset(
     vocab = AtomicVocabulary(atomic_vocabulary(variant))
     sequences: dict[str, list[list[int]]] = {"train": [], "val": [], "test": []}
     source_kinds: dict[str, list[int]] = {"train": [], "val": [], "test": []}
+    skeleton_masks: dict[str, list[list[bool]]] = {"train": [], "val": [], "test": []}
+    file_ids: dict[str, list[int]] = {"train": [], "val": [], "test": []}
     split_files = []
     digest = hashlib.sha256()
-    for source in files:
+    for source_index, source in enumerate(files):
         documents = [parse_derbake(source, max_beats_per_cycle=max_beats_per_cycle)]
         digest.update(source.name.encode("utf-8"))
         digest.update(hashlib.sha256(source.read_bytes()).digest())
@@ -242,8 +307,14 @@ def prepare_dataset(
         for source_kind, document in enumerate(documents):
             for split_name, (start, end) in ranges.items():
                 piece = RhythmSequence(document.rhythm.cycles[start:end])
-                sequences[split_name].append(vocab.encode(schema.encode(piece)))
+                atoms = schema.encode(piece)
+                mask = skeleton_atom_mask(document, start, end, variant)
+                if len(mask) != len(atoms):
+                    raise RuntimeError("Skeleton provenance differs from encoded atoms")
+                sequences[split_name].append(vocab.encode(atoms))
                 source_kinds[split_name].append(source_kind)
+                skeleton_masks[split_name].append(mask)
+                file_ids[split_name].append(source_index)
     output_dir.mkdir(parents=True, exist_ok=True)
     rhythm_info = build_rhythm_lookup_arrays(list(vocab.tokens), max_beat_positions=8)
     stats = {}
@@ -253,8 +324,10 @@ def prepare_dataset(
             vocab.to_id["<PAD>"], rhythm_info, max_beats_per_cycle,
             create_target_masks=True,
             source_kinds=source_kinds[split_name],
+            skeleton_targets=skeleton_masks[split_name],
+            source_file_ids=file_ids[split_name],
         )
-    manifest = {"format_version": 2, "preparation_version": 1,
+    manifest = {"format_version": 2, "preparation_version": 3,
                 "normalization_version": "skeleton_overlay_v1",
                 "split_version": "per_file_contiguous_cycles_v1",
                 "variant": variant, "vocab_hash": vocab.hash,

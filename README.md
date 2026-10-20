@@ -76,6 +76,30 @@ examples' training sampling weight; validation and test remain unweighted.
 
 ## Train later
 
+The recommended Colab entry point is [`notebooks/ldm_training.ipynb`](notebooks/ldm_training.ipynb).
+Its named `RunConfig` presets use package enums for variants, attention,
+activation and position encoding. `prepare_or_load_dataset` hashes the full
+recipe and source bytes; `start_run` creates a unique Drive run ID; inspect and
+resume are separate actions. New run folders contain `experiment.json`, live
+`training.log`, `last.pt`, `best.pt`, `evaluations.jsonl`, `metrics.json` and
+optional reports. The older fixed-path CLI remains for existing runs.
+
+Experiment controls include validation cadence, evaluation batch size, AdamW
+weight decay, CUDA AMP, gradient clipping, early stopping and explicit step,
+time, loss and divergence stops. The selected checkpoint is chosen only by
+validation loss; final test metrics use that checkpoint. Reports use unique
+scored targets and include ordinary/decorated, HIT, structure, decoration,
+skeleton and (for `with_subd`) hit-count measures. Optional package functions
+generate review files, WAV previews from supplied samples, embedding neighbors,
+contextual PCA tables, plots and comparison CSVs. The WAV renderer needs four
+mono 16-bit WAV sample folders at its selected sample rate.
+
+This workflow has pure Python contract coverage locally. Its Torch training,
+resume and HF snapshot paths must be exercised in Colab on the pinned dataset
+before a production release. Existing Drive runs are not migrated or overwritten.
+
+The older direct CLI command is still available:
+
 ```bash
 python -m ldm.cli train --dataset datasets/with_subd --run runs/with_subd \
   --epochs 10 --batch-size 4 --learning-rate 0.0003

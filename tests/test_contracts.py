@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import patch
 import numpy as np
@@ -15,6 +16,10 @@ from ldm.schema_ldm import RhythmSchema
 from ldm.splits import split_cycle_ranges
 from ldm.vocabulary import AtomicVocabulary, atomic_vocabulary
 from ldm.dataset_ldm import prepare_dataset
+from ldm.experiment_config import DataConfig, DatasetVariant, RunConfig
+from ldm.experiment_workflow import make_run_id, prepare_or_load_dataset
+from ldm.review_ldm import InferenceConfig, render_wav
+from dataclasses import replace
 
 
 class CliDispatchTests(unittest.TestCase):
@@ -32,6 +37,63 @@ class CliDispatchTests(unittest.TestCase):
 
 
 class DerbakeContractTests(unittest.TestCase):
+    def test_optional_wav_renderer_and_sampling_validation(self):
+        with self.assertRaises(ValueError):
+            InferenceConfig(top_p=0)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
+            root = Path(folder)
+            rhythm = root / "rhythm.derbake"
+            write_derbake(RhythmSequence(((Beat(1, ("HIT_D_decorated",)),),)), rhythm)
+            folders = {}
+            for name in ("doums", "taks", "tiks", "pa2s"):
+                directory = root / name
+                directory.mkdir()
+                folders[name] = directory
+                with wave.open(str(directory / "sample.wav"), "wb") as handle:
+                    handle.setnchannels(1)
+                    handle.setsampwidth(2)
+                    handle.setframerate(22050)
+                    handle.writeframes(np.array([0, 1000, 0], dtype="<i2").tobytes())
+            output = render_wav(rhythm, folders, root / "preview.wav")
+            with wave.open(str(output), "rb") as handle:
+                self.assertEqual(handle.getframerate(), 22050)
+                self.assertGreater(handle.getnframes(), 3)
+
+    def test_typed_run_config_round_trip_and_cache_recipe(self):
+        config = RunConfig("demo", data=DataConfig(
+            variant=DatasetVariant.NO_SUBD, context_size=16, stride=8,
+            include_decorated=False))
+        self.assertEqual(RunConfig.from_dict(config.to_dict()), config)
+        self.assertIn("demo_no_subd_ctx16", make_run_id(config))
+        with self.assertRaises(TypeError):
+            RunConfig("bad", data=replace(config.data, variant="no_subd"))
+        rhythm = RhythmSequence(tuple((Beat(1, ("HIT_D",)),) for _ in range(10)))
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
+            root = Path(folder)
+            source = root / "normal"
+            source.mkdir()
+            write_derbake(rhythm, source / "one.derbake")
+            first = prepare_or_load_dataset(config, source, None, root / "cache")
+            self.assertEqual(first, prepare_or_load_dataset(config, source, None, root / "cache"))
+            changed = replace(config, data=replace(config.data, context_size=24))
+            self.assertNotEqual(first, prepare_or_load_dataset(changed, source, None, root / "cache"))
+
+    def test_skeleton_target_mask_is_scored_once(self):
+        rhythm = RhythmSequence(tuple((Beat(1, ("HIT_D",)),) for _ in range(10)))
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
+            root = Path(folder)
+            source = root / "normal"
+            source.mkdir()
+            path = source / "one.derbake"
+            write_derbake(rhythm, path)
+            lines = path.read_text(encoding="utf-8").splitlines()
+            lines[3] = "DELAY_0 HIT_D_SKEL DEV_0"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            prepare_dataset(source, root / "prepared", variant="with_subd",
+                            context_size=8, max_beats_per_cycle=16, stride=4)
+            skeleton = np.load(root / "prepared" / "train_skeleton_mask.npy")
+            self.assertEqual(int(skeleton.sum()), 1)
+
     def test_invalid_atom_ids_and_subdivisions_are_rejected(self):
         vocab = AtomicVocabulary(atomic_vocabulary("with_subd"))
         with self.assertRaises(ValueError):
@@ -142,6 +204,8 @@ class DerbakeContractTests(unittest.TestCase):
                                      manifest["stats"][split]["chunks"])
                     self.assertEqual(set(np.load(destination / f"{split}_source_kind.npy")),
                                      {0, 1})
+                    self.assertEqual(set(np.load(destination / f"{split}_source_file.npy")),
+                                     {0})
 
 
 if __name__ == "__main__":

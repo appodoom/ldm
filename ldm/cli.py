@@ -55,6 +55,27 @@ def _validate(args):
         subprocess.run(command, check=True, cwd=folder)
 
 
+def _experiment(args):
+    from .experiment_config import RunConfig
+    from .experiment_workflow import (compare_runs, inspect_run, list_runs,
+                                      prepare_or_load_dataset, resume_run, start_run)
+
+    if args.action == "list":
+        print(json.dumps(list_runs(args.runs_root), indent=2))
+    elif args.action == "inspect":
+        print(json.dumps(inspect_run(args.run), indent=2))
+    elif args.action == "compare":
+        print(json.dumps(compare_runs(args.runs), indent=2))
+    elif args.action == "start":
+        config = RunConfig.from_dict(json.loads(args.config.read_text(encoding="utf-8")))
+        dataset = prepare_or_load_dataset(config, args.ordinary, args.decorated, args.cache_root)
+        run = start_run(config, dataset, args.runs_root, device=args.device)
+        print(f"Run: {run}")
+    elif args.action == "resume":
+        print(json.dumps(resume_run(args.run, target_epochs=args.target_epochs,
+                                    device=args.device), indent=2))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="python -m ldm.cli")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -94,6 +115,30 @@ def main(argv=None):
     validation = commands.add_parser("validate")
     validation.add_argument("--snapshot", type=Path, required=True)
     validation.set_defaults(handler=_validate)
+    experiment = commands.add_parser("experiment")
+    actions = experiment.add_subparsers(dest="action", required=True)
+    start = actions.add_parser("start")
+    start.add_argument("--config", type=Path, required=True)
+    start.add_argument("--ordinary", type=Path, required=True)
+    start.add_argument("--decorated", type=Path)
+    start.add_argument("--cache-root", type=Path, required=True)
+    start.add_argument("--runs-root", type=Path, required=True)
+    start.add_argument("--device")
+    start.set_defaults(handler=_experiment)
+    resume = actions.add_parser("resume")
+    resume.add_argument("--run", type=Path, required=True)
+    resume.add_argument("--target-epochs", type=int)
+    resume.add_argument("--device")
+    resume.set_defaults(handler=_experiment)
+    inspect = actions.add_parser("inspect")
+    inspect.add_argument("--run", type=Path, required=True)
+    inspect.set_defaults(handler=_experiment)
+    listed = actions.add_parser("list")
+    listed.add_argument("--runs-root", type=Path, required=True)
+    listed.set_defaults(handler=_experiment)
+    compare = actions.add_parser("compare")
+    compare.add_argument("runs", nargs="+", type=Path)
+    compare.set_defaults(handler=_experiment)
     args = parser.parse_args(argv)
     args.handler(args)
 

@@ -48,10 +48,23 @@ def build_local_snapshot(run_dir: str | Path, output_dir: str | Path) -> dict:
                "derbake_format_version": config.derbake_format_version,
                "token_schema_version": config.token_schema_version,
                "source_epoch": checkpoint["epoch"], "source_val_loss": checkpoint["val_loss"]}
+    experiment_path = run_dir / "experiment.json"
+    if experiment_path.exists():
+        experiment = json.loads(experiment_path.read_text(encoding="utf-8"))
+        payload.update({"run_id": experiment["run_id"],
+                        "source_code_commit": experiment.get("code_commit")})
+    metrics_path = run_dir / "metrics.json"
+    if metrics_path.exists():
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        payload["metric_version"] = metrics.get("test_report", {}).get("metric_version")
+    dataset_ref = json.loads((run_dir / "dataset_ref.json").read_text(encoding="utf-8"))
+    payload["split_version"] = dataset_ref.get("split_version")
     metadata = output_dir / "metadata"
     metadata.mkdir()
     for name in ("run_config.json", "dataset_ref.json"):
         shutil.copyfile(run_dir / name, metadata / name)
+    if experiment_path.exists():
+        shutil.copyfile(experiment_path, metadata / "experiment.json")
     (metadata / "source_run.json").write_text(json.dumps({
         "epoch": checkpoint["epoch"], "validation_loss": checkpoint["val_loss"],
         "checkpoint_sha256": payload["source_checkpoint_sha256"]}, indent=2) + "\n",
