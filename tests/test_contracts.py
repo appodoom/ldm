@@ -76,7 +76,7 @@ class DerbakeContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
             root = Path(folder)
             with self.assertRaises(ValueError):
-                check_run_name(config, root, {"one": config, "two": config})
+                check_run_name(config, root, [config, config])
             (root / "demo").mkdir()
             with self.assertRaisesRegex(FileExistsError, "already exists"):
                 check_run_name(config, root)

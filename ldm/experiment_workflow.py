@@ -10,7 +10,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable
 
 from .experiment_config import RunConfig
 
@@ -116,14 +116,15 @@ def make_run_id(config: RunConfig, now: datetime | None = None) -> str:
 
 
 def check_run_name(config: RunConfig, runs_root: str | Path,
-                   registry: Mapping[str, RunConfig] | None = None) -> str:
+                   registry: Iterable[RunConfig] | None = None) -> str:
     """Fail early for a reused custom name; automatic names remain unique attempts."""
     if config.name is None:
         return make_run_id(config)
     if registry is not None:
-        matches = [key for key, value in registry.items() if value.name == config.name]
+        matches = [index for index, value in enumerate(registry) if value.name == config.name]
         if len(matches) > 1:
-            raise ValueError(f"Custom run name {config.name!r} is used by multiple presets: {matches}")
+            raise ValueError(f"Custom run name {config.name!r} is used by multiple presets "
+                             f"at positions {matches}")
     path = Path(runs_root) / config.name
     if path.exists():
         raise FileExistsError(f"Run name {config.name!r} already exists at {path}; "
