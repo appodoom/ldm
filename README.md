@@ -80,8 +80,10 @@ The recommended Colab entry point is [`notebooks/ldm_training.ipynb`](notebooks/
 Its `RunConfig` presets live directly in one list; each entry selects its
 variant in `DataConfig` and uses package enums for attention,
 activation and position encoding. `prepare_or_load_dataset` hashes the full
-recipe and source bytes; `start_run` normally creates the old-style timestamp,
-settings and hash run ID. An optional `RunConfig(name="...")` uses that exact
+recipe and source bytes. The notebook prepares and trains every list entry
+sequentially, creating one Drive run for each. `start_run` normally creates
+the old-style timestamp, settings and hash run ID. An optional
+`RunConfig(name="...")` uses that exact
 folder name and rejects duplicates. Inspect and
 resume are separate actions. New run folders contain `experiment.json`, live
 `training.log`, `last.pt`, `best.pt`, `evaluations.jsonl`, `metrics.json` and
