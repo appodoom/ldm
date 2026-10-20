@@ -154,7 +154,10 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
             raise ValueError("Resume checkpoint has different dataset/config")
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
-        scaler.load_state_dict(checkpoint["scaler"])
+        # CPU runs disable scaling and save an empty state. A resumed CUDA run
+        # may initialize a fresh scaler when the source checkpoint used CPU.
+        if scaler.is_enabled() and checkpoint["scaler"]:
+            scaler.load_state_dict(checkpoint["scaler"])
         _restore_rng(checkpoint["rng"])
         epoch_start, batch_start, step = checkpoint["epoch"], checkpoint["batch"], checkpoint["step"]
         best = checkpoint["best_val_loss"]
