@@ -112,7 +112,10 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
                   "decorated_weight": manifest.get("decorated_weight")}
     run_config_path = run_dir / "run_config.json"
     if resume:
-        if json.loads(run_config_path.read_text(encoding="utf-8")) != run_config:
+        # JSON turns integer dictionary keys (for example id2label) into strings.
+        # Compare the saved file to the same serialized representation.
+        saved_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+        if saved_config != json.loads(json.dumps(run_config)):
             raise ValueError("Resume settings differ from the original run")
     elif run_config_path.exists() or (run_dir / "last.pt").exists():
         raise ValueError("Run directory already contains a run; use --resume or another path")
