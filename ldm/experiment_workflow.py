@@ -10,6 +10,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Mapping
 
 from .experiment_config import RunConfig
 
@@ -106,10 +107,28 @@ def model_config_for_run(run: RunConfig, dataset: str | Path):
 
 
 def make_run_id(config: RunConfig, now: datetime | None = None) -> str:
+    if config.name is not None:
+        return config.name
     now = now or datetime.now(timezone.utc)
     m, d = config.model, config.data
-    return (f"{now:%Y%m%d-%H%M%S}_{config.name}_{d.variant.value}_ctx{d.context_size}_"
-            f"L{m.layers}H{m.heads}E{m.embeddings}_{config.fingerprint[:8]}")
+    return (f"run_{now:%Y%m%d-%H%M%S}_{d.variant.value}_ctx{d.context_size}_"
+            f"s{d.resolved_stride}_L{m.layers}H{m.heads}E{m.embeddings}_{config.fingerprint[:8]}")
+
+
+def check_run_name(config: RunConfig, runs_root: str | Path,
+                   registry: Mapping[str, RunConfig] | None = None) -> str:
+    """Fail early for a reused custom name; automatic names remain unique attempts."""
+    if config.name is None:
+        return make_run_id(config)
+    if registry is not None:
+        matches = [key for key, value in registry.items() if value.name == config.name]
+        if len(matches) > 1:
+            raise ValueError(f"Custom run name {config.name!r} is used by multiple presets: {matches}")
+    path = Path(runs_root) / config.name
+    if path.exists():
+        raise FileExistsError(f"Run name {config.name!r} already exists at {path}; "
+                              "choose another name or use Resume")
+    return config.name
 
 
 def _code_commit() -> str | None:
@@ -160,12 +179,18 @@ def start_run(config: RunConfig, dataset: str | Path, runs_root: str | Path,
 
     runs_root = Path(runs_root)
     runs_root.mkdir(parents=True, exist_ok=True)
-    run_dir = runs_root / make_run_id(config)
-    suffix = 2
-    while run_dir.exists():
-        run_dir = runs_root / f"{make_run_id(config)}_{suffix}"
-        suffix += 1
-    run_dir.mkdir()
+    run_name = check_run_name(config, runs_root)
+    suffix = 1
+    while True:
+        run_dir = runs_root / (run_name if suffix == 1 else f"{run_name}_{suffix}")
+        try:
+            run_dir.mkdir()
+            break
+        except FileExistsError as exc:
+            if config.name is not None:
+                raise FileExistsError(f"Run name {run_dir.name!r} already exists; "
+                                      "choose another name or use Resume") from exc
+            suffix += 1
     dataset = Path(dataset).resolve()
     manifest_bytes = (dataset / "dataset_manifest.json").read_bytes()
     record = {"run_id": run_dir.name, "status": "created", "config": config.to_dict(),

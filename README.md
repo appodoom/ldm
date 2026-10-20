@@ -77,9 +77,11 @@ examples' training sampling weight; validation and test remain unweighted.
 ## Train later
 
 The recommended Colab entry point is [`notebooks/ldm_training.ipynb`](notebooks/ldm_training.ipynb).
-Its named `RunConfig` presets use package enums for variants, attention,
+Its `RunConfig` presets use package enums for variants, attention,
 activation and position encoding. `prepare_or_load_dataset` hashes the full
-recipe and source bytes; `start_run` creates a unique Drive run ID; inspect and
+recipe and source bytes; `start_run` normally creates the old-style timestamp,
+settings and hash run ID. An optional `RunConfig(name="...")` uses that exact
+folder name and rejects duplicates. Inspect and
 resume are separate actions. New run folders contain `experiment.json`, live
 `training.log`, `last.pt`, `best.pt`, `evaluations.jsonl`, `metrics.json` and
 optional reports. The older fixed-path CLI remains for existing runs.

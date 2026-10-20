@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import wave
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 import numpy as np
@@ -17,7 +18,7 @@ from ldm.splits import split_cycle_ranges
 from ldm.vocabulary import AtomicVocabulary, atomic_vocabulary
 from ldm.dataset_ldm import prepare_dataset
 from ldm.experiment_config import DataConfig, DatasetVariant, RunConfig
-from ldm.experiment_workflow import make_run_id, prepare_or_load_dataset
+from ldm.experiment_workflow import check_run_name, make_run_id, prepare_or_load_dataset
 from ldm.review_ldm import InferenceConfig, render_wav
 from dataclasses import replace
 
@@ -64,12 +65,21 @@ class DerbakeContractTests(unittest.TestCase):
             variant=DatasetVariant.NO_SUBD, context_size=16, stride=8,
             include_decorated=False))
         self.assertEqual(RunConfig.from_dict(config.to_dict()), config)
-        self.assertIn("demo_no_subd_ctx16", make_run_id(config))
+        self.assertEqual(make_run_id(config), "demo")
+        automatic = replace(config, name=None)
+        self.assertEqual(automatic.fingerprint, config.fingerprint)
+        self.assertRegex(make_run_id(automatic, datetime(2026, 10, 20, tzinfo=timezone.utc)),
+                         r"^run_20261020-000000_no_subd_ctx16_s8_L4H4E256_[0-9a-f]{8}$")
         with self.assertRaises(TypeError):
             RunConfig("bad", data=replace(config.data, variant="no_subd"))
         rhythm = RhythmSequence(tuple((Beat(1, ("HIT_D",)),) for _ in range(10)))
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
             root = Path(folder)
+            with self.assertRaises(ValueError):
+                check_run_name(config, root, {"one": config, "two": config})
+            (root / "demo").mkdir()
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                check_run_name(config, root)
             source = root / "normal"
             source.mkdir()
             write_derbake(rhythm, source / "one.derbake")

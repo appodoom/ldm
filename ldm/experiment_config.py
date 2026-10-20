@@ -102,15 +102,15 @@ class EvalConfig:
 
 @dataclass(frozen=True)
 class RunConfig:
-    name: str
+    name: str | None = None
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     evaluation: EvalConfig = field(default_factory=EvalConfig)
 
     def __post_init__(self) -> None:
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,39}", self.name):
-            raise ValueError("Run name needs 1-40 letters, digits, underscores or hyphens")
+        if self.name is not None and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", self.name):
+            raise ValueError("Custom run name needs 1-80 letters, digits, underscores or hyphens")
         d, m, t, e = self.data, self.model, self.train, self.evaluation
         for value, expected in ((d.variant, DatasetVariant), (m.attention, AttentionLayout),
                                 (m.activation, Activation), (m.position, PositionEncoding)):
@@ -166,10 +166,12 @@ class RunConfig:
         model["activation"] = Activation(model["activation"])
         model["position"] = PositionEncoding(model["position"])
         model["streams"] = StructuredStreams(**model["streams"])
-        return cls(payload["name"], DataConfig(**data), ModelConfig(**model),
+        return cls(payload.get("name"), DataConfig(**data), ModelConfig(**model),
                    TrainConfig(**payload["train"]), EvalConfig(**payload["evaluation"]))
 
     @property
     def fingerprint(self) -> str:
-        raw = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")).encode()
+        settings = self.to_dict()
+        settings.pop("name", None)
+        raw = json.dumps(settings, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(raw).hexdigest()
