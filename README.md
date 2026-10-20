@@ -77,8 +77,8 @@ examples' training sampling weight; validation and test remain unweighted.
 ## Train later
 
 The recommended Colab entry point is [`notebooks/ldm_training.ipynb`](notebooks/ldm_training.ipynb).
-Its `RunConfig` presets are separate objects collected in a list, like the
-earlier notebook, and use package enums for variants, attention,
+Its `RunConfig` presets live directly in one list; each entry selects its
+variant in `DataConfig` and uses package enums for attention,
 activation and position encoding. `prepare_or_load_dataset` hashes the full
 recipe and source bytes; `start_run` normally creates the old-style timestamp,
 settings and hash run ID. An optional `RunConfig(name="...")` uses that exact
