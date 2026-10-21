@@ -4,6 +4,7 @@ Extracted from the notebook without changing the attention equations.
 """
 from __future__ import annotations
 from contextlib import contextmanager
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 import math
 import torch
@@ -11,6 +12,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from .rhythm_ldm import STRUCTURED_ROUTING_FIELDS, count_hit_atoms, parse_subdivision_token
+from .validation import validate_rules
 
 def configure_cuda_precision(device, *, allow_tf32: bool = True) -> dict:
     """Set the old notebook's CUDA precision policy explicitly for this process."""
@@ -202,17 +204,13 @@ VALID_ATTENTION_LAYOUTS = frozenset({"global", "alternating_global_structured"})
 
 def make_activation(name: str) -> nn.Module:
     name = name.lower().strip()
-    if name == "gelu":
-        return nn.GELU()
-    if name == "relu":
-        return nn.ReLU()
-    if name in {"silu", "swish"}:
-        return nn.SiLU()
-    if name == "tanh":
-        return nn.Tanh()
-    if name in {"leaky_relu", "lrelu"}:
-        return nn.LeakyReLU(negative_slope=0.1)
-    raise ValueError(f"Unknown activation: {name}")
+    name = {"swish": "silu", "lrelu": "leaky_relu"}.get(name, name)
+    factories = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU, "tanh": nn.Tanh,
+                 "leaky_relu": partial(nn.LeakyReLU, negative_slope=0.1)}
+    try:
+        return factories[name]()
+    except KeyError as exc:
+        raise ValueError(f"Unknown activation: {name}") from exc
 
 
 def resolve_attention_layout(attention_layout: str, number_of_layers: int) -> List[str]:
@@ -1213,16 +1211,20 @@ class GPT(nn.Module):
         self.vocab_size = len(token_to_id)
         self.context_size = int(context_size)
         self.position_encoding = str(position_encoding).strip().lower()
-        if self.position_encoding not in {"sinusoidal", "rope"}:
-            raise ValueError("position_encoding must be 'sinusoidal' or 'rope'")
         self.rope_theta = float(rope_theta)
         self.rope_fraction = float(rope_fraction)
-        if not math.isfinite(self.rope_theta) or self.rope_theta <= 0:
-            raise ValueError("rope_theta must be finite and positive")
-        if not math.isfinite(self.rope_fraction) or not 0 < self.rope_fraction <= 1:
-            raise ValueError("rope_fraction must be in (0, 1]")
-        if number_of_embeddings % number_of_heads != 0:
-            raise ValueError("number_of_embeddings must be divisible by number_of_heads")
+        validate_rules({
+            "position_encoding": (self.position_encoding in {"sinusoidal", "rope"},
+                                  "must be 'sinusoidal' or 'rope'"),
+            "rope_theta": (math.isfinite(self.rope_theta) and self.rope_theta > 0, "must be finite and positive"),
+            "rope_fraction": (math.isfinite(self.rope_fraction) and 0 < self.rope_fraction <= 1,
+                              "must be in (0, 1]"),
+            "number_of_heads": (number_of_heads > 0, "must be positive"),
+            "number_of_embeddings": (number_of_heads > 0 and number_of_embeddings % number_of_heads == 0,
+                                     "must be divisible by number_of_heads"),
+            "max_beats_per_cycle": (max_beats_per_cycle is not None and int(max_beats_per_cycle) > 0,
+                                    "is required and must be positive"),
+        })
         head_dim = number_of_embeddings // number_of_heads
         rotary_dim = int(head_dim * self.rope_fraction)
         rotary_dim -= rotary_dim % 2
@@ -1238,12 +1240,12 @@ class GPT(nn.Module):
         self.max_tokens_per_beat = int(max_tokens_per_beat or 0)
         self.max_beat_slots_per_chunk = int(max_beat_slots_per_chunk or 0)
         self.max_cycles_per_chunk = int(max_cycles_per_chunk or 0)
-        if self.has_structured_layers:
-            if self.position_encoding != "rope":
-                raise ValueError(
-                    "alternating_global_structured requires position_encoding='rope' "
-                    "for the stream-specific coordinate systems"
-                )
+        validate_rules({
+            "position_encoding": (
+                not self.has_structured_layers or self.position_encoding == "rope",
+                "alternating_global_structured requires position_encoding='rope' for the stream-specific coordinate systems",
+            ),
+        })
 
         self.use_type_embeddings = bool(use_type_embeddings)
         self.concat_type_embeddings = bool(concat_type_embeddings) and self.use_type_embeddings
@@ -1277,8 +1279,6 @@ class GPT(nn.Module):
         self.id_eoc = token_to_id.get("<EOC>")
         self.id_sob = token_to_id.get("<SOB>")
         self.id_eob = token_to_id.get("<EOB>")
-        if max_beats_per_cycle is None or int(max_beats_per_cycle) <= 0:
-            raise ValueError("max_beats_per_cycle is required and must be positive")
         self.max_beats_per_cycle = int(max_beats_per_cycle)
         self.beat_idx_embeddings = nn.Embedding(
             self.max_beats_per_cycle, number_of_embeddings

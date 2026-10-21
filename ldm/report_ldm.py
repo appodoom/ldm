@@ -61,8 +61,8 @@ def save_test_accuracy_comparison(run_dirs: list[str | Path], output: str | Path
         raise ValueError('No finite test accuracy values to plot')
     group_ids = {}
     for row in rows:
-        identity = (row['dataset_fingerprint'], row['split_version'], row['metric_version'])
-        if row['split_version'] is None or row['metric_version'] is None:
+        identity = (row['dataset_fingerprint'], row['split_rule'], row['metric_version'])
+        if row['metric_version'] is None:
             identity = ('unverified', row['run_id'])
         row['comparison_group'] = group_ids.setdefault(identity, len(group_ids) + 1)
     figure, ax = plt.subplots(figsize=(12, max(4, len(rows) * 1.2)))
@@ -75,7 +75,7 @@ def save_test_accuracy_comparison(run_dirs: list[str | Path], output: str | Path
     ax.bar_label(bars, fmt='%.2f%%', padding=3)
     ax.set(xlabel='Test token accuracy (%)', xlim=(0, 105), title='Best-checkpoint test accuracy')
     ax.grid(axis='x', alpha=0.25)
-    figure.text(0.01, 0.01, 'Compare within the same group: matching dataset, split, and metric versions.', fontsize=9)
+    figure.text(0.01, 0.01, 'Compare within the same group: matching dataset, splitting rule, and metric version.', fontsize=9)
     figure.tight_layout(rect=(0, 0.05, 1, 1))
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)

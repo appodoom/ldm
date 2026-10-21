@@ -12,6 +12,8 @@ from transformers.modeling_outputs import CausalLMOutput
 
 from .configuration_ldm import LDMConfig
 from .cycle_collector import IncompleteGenerationError
+from .validation import validate_rules  # HF caches only direct relative imports.
+from .constants import HITS  # HF caches only direct relative imports.
 from .derbake_ldm import RhythmSequence  # HF caches only direct relative imports.
 from .generation_ldm import generate_continuation_ids
 from .model_core import GPT
@@ -89,10 +91,10 @@ class LDMModel(PreTrainedModel):
                  temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0,
                  seed: int | None = None, return_generation_report: bool = False,
                  cache_refresh_tokens: int = 256):
-        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-            raise ValueError("LDM generation supports batch size 1")
-        if input_ids.shape[1] < 1 or input_ids.shape[1] > self.config.context_size:
-            raise ValueError("Prompt length exceeds model context")
+        validate_rules({"input_ids": (input_ids.ndim == 2 and input_ids.shape[0] == 1,
+                                     "LDM generation supports batch size 1")})
+        validate_rules({"prompt_length": (1 <= input_ids.shape[1] <= self.config.context_size,
+                                         "Prompt length exceeds model context")})
         schema = RhythmSchema(self.config.dataset_variant, self.config.max_beats_per_cycle)
         prompt_ids = input_ids[0].tolist()
         if any(index < 0 or index >= len(self.vocab) for index in prompt_ids):

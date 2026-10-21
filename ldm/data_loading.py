@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .rhythm_ldm import STRUCTURED_ROUTING_FIELDS
+from .validation import validate_rules
 
 
 class ChunkDataset:
@@ -16,7 +17,6 @@ class ChunkDataset:
         folder = Path(folder)
         self.folder, self.split = folder, split
         self.ids = np.load(folder / f"{split}.npy", mmap_mode="r")
-        self.source_kind = np.load(folder / f"{split}_source_kind.npy", mmap_mode="r")
         file_path = folder / f"{split}_source_file.npy"
         self.source_file = np.load(file_path, mmap_mode="r") if file_path.exists() else None
         self.file_names = [entry["file"] for entry in json.loads(
@@ -29,14 +29,15 @@ class ChunkDataset:
         self.skeleton = np.load(skeleton_path, mmap_mode="r") if skeleton_path.exists() else None
         self.routing = {field: np.load(folder / f"{split}_{field}.npy", mmap_mode="r")
                         for field in STRUCTURED_ROUTING_FIELDS}
-        if not all(len(array) == len(self.ids) for array in
-                   (self.source_kind, self.beat_idx, self.beat_pos, self.score,
-                    self.hit_count, *self.routing.values())):
-            raise ValueError("Prepared array row counts disagree")
-        if self.skeleton is not None and len(self.skeleton) != len(self.ids):
-            raise ValueError("Skeleton mask row count disagrees")
-        if self.source_file is not None and len(self.source_file) != len(self.ids):
-            raise ValueError("Source-file row count disagrees")
+        validate_rules({
+            "arrays": (all(len(array) == len(self.ids) for array in
+                       (self.beat_idx, self.beat_pos, self.score, self.hit_count, *self.routing.values())),
+                       "Prepared array row counts disagree"),
+            "skeleton_mask": (self.skeleton is None or len(self.skeleton) == len(self.ids),
+                              "Skeleton mask row count disagrees"),
+            "source_file": (self.source_file is None or len(self.source_file) == len(self.ids),
+                            "Source-file row count disagrees"),
+        })
 
     def __getstate__(self):
         # Reopen memory maps in spawned workers instead of pickling array contents.

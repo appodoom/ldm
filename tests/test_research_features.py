@@ -27,11 +27,12 @@ class IntegrityTests(unittest.TestCase):
             manifest = prepare_dataset(source, root / 'data', variant='with_subd', context_size=16, max_beats_per_cycle=4)
             config = {key: manifest[key] for key in ('vocab_hash', 'context_size', 'max_beats_per_cycle')}
             config['dataset_variant'] = 'with_subd'
+            config['dataset_decoration'] = manifest['decoration']
             config['attention_layout'] = 'alternating_global_structured'
             for key in ('max_tokens_per_beat', 'max_beat_slots_per_chunk', 'max_cycles_per_chunk'):
                 config[key] = max(stats[key] for stats in manifest['stats'].values())
             self.assertEqual(verify_dataset(root / 'data', model_config=config), verify_dataset(root / 'data'))
-            for key, value in (('dataset_variant', 'no_subd'), ('vocab_hash', 'wrong'),
+            for key, value in (('dataset_decoration', 'decorated'), ('dataset_variant', 'no_subd'), ('vocab_hash', 'wrong'),
                                ('context_size', 32), ('max_cycles_per_chunk', 0)):
                 with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'differs from model'):
                     verify_dataset(root / 'data', model_config={**config, key: value})
@@ -45,10 +46,10 @@ class IntegrityTests(unittest.TestCase):
             write_derbake(RhythmSequence(tuple((Beat(1, ('HIT_D',)),) for _ in range(10))), source / 'a.derbake')
             target = root / 'prepared'
             manifest = prepare_dataset(source, target, variant='with_subd', context_size=16, max_beats_per_cycle=4)
-            self.assertEqual(len(manifest['artifacts']), 3 * 15)
+            self.assertEqual(len(manifest['artifacts']), 3 * 14)
             original = verify_dataset(target)
             # Absolute source locations do not affect dataset identity.
-            manifest['ordinary_dir'] = '/different/source/location'
+            manifest['source_dir'] = '/different/source/location'
             (target / 'dataset_manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
             self.assertEqual(dataset_fingerprint(target), original)
             array = np.load(target / 'val_beat_slot.npy', mmap_mode='r+')
@@ -74,6 +75,9 @@ class ResearchMetricTests(unittest.TestCase):
         self.assertEqual(result['decorated_outcomes'], {'total': 5, 'exact_decorated': 1,
             'wrong_decorated_type': 1, 'correct_plain_hit': 1, 'other': 2})
         self.assertEqual(result['decorated_plain_hit_accuracy'], 0.2)
+        self.assertEqual(result['decorated_wrong_type_rate'], 0.2)
+        self.assertEqual(result['decorated_accuracy'], 0.2)
+        self.assertIsNone(TokenCounts(vocab).result()['decorated_wrong_type_rate'])
         self.assertEqual(result['decorated_outcomes_by_type']['HIT_D_decorated'], result['decorated_outcomes'])
         self.assertIsNone(TokenCounts(vocab).result()['decorated_plain_hit_accuracy'])
 
@@ -89,6 +93,20 @@ class ResearchMetricTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec('torch'), 'PyTorch runtime required')
 class AttentionChecks(unittest.TestCase):
+    def test_activation_dispatch_preserves_outputs_and_aliases(self):
+        import torch
+        from ldm.model_core import make_activation
+        x = torch.tensor([-2.0, 0.0, 2.0])
+        expected = {"gelu": torch.nn.GELU(), "relu": torch.nn.ReLU(), "tanh": torch.nn.Tanh(),
+                    "silu": torch.nn.SiLU(), "swish": torch.nn.SiLU(),
+                    "leaky_relu": torch.nn.LeakyReLU(negative_slope=0.1),
+                    "lrelu": torch.nn.LeakyReLU(negative_slope=0.1)}
+        for name, activation in expected.items():
+            with self.subTest(name=name):
+                torch.testing.assert_close(make_activation(name)(x), activation(x))
+        with self.assertRaisesRegex(ValueError, "Unknown activation"):
+            make_activation("unknown")
+
     def test_precision_policy_and_config_round_trip(self):
         import torch
         from ldm.model_core import configure_cuda_precision
@@ -300,7 +318,7 @@ class AttentionChecks(unittest.TestCase):
         keys = ('number_of_layers', 'number_of_heads', 'number_of_embeddings', 'mlp_ratio',
                 'dropout', 'position_encoding', 'rope_theta', 'rope_fraction', 'tie_weights',
                 'use_type_embeddings', 'concat_type_embeddings', 'dataset_variant', 'vocab_hash',
-                'activation_name', 'max_beat_positions', 'max_beats_per_cycle', 'max_tokens_per_beat',
+                'activation_name', 'dataset_decoration', 'max_beat_positions', 'max_beats_per_cycle', 'max_tokens_per_beat',
                 'max_beat_slots_per_chunk', 'max_cycles_per_chunk')
         config = dict.fromkeys(keys, 1)
         baseline = {'profile_version': 1, 'device_name': 'test GPU', 'torch_version': 'test',
@@ -312,6 +330,9 @@ class AttentionChecks(unittest.TestCase):
         candidate = {**baseline, 'config': {**config, 'attention_layout': 'alternating_global_structured'},
                      'mean_step_ms': 8, 'peak_allocated_gib': 1}
         self.assertTrue(compare_profiles(baseline, candidate)['optimization_gate_passed'])
+        incomplete = {**candidate, 'config': {key: value for key, value in candidate['config'].items() if key != 'attention_layout'}}
+        with self.assertRaisesRegex(ValueError, 'incomplete model configuration'):
+            compare_profiles(baseline, incomplete)
         with self.assertRaisesRegex(ValueError, 'dataset_fingerprint'):
             compare_profiles(baseline, {**candidate, 'dataset_fingerprint': 'different'})
 
@@ -330,10 +351,10 @@ class ComparisonPlotTests(unittest.TestCase):
                 run.mkdir()
                 (run / 'experiment.json').write_text(json.dumps({'run_id': run.name, 'status': 'completed',
                     'config_fingerprint': 'config', 'dataset_fingerprint': f'data{i}',
-                    'config': {'data': {'variant': 'with_subd'}}}), encoding='utf-8')
+                    'config': {'data': {'variant': 'with_subd', 'decoration': 'normal'}}}), encoding='utf-8')
                 (run / 'metrics.json').write_text(json.dumps({'test_report': {'metric_version': 2,
                     'combined': {'token_accuracy': accuracy}}}), encoding='utf-8')
-                (run / 'dataset_ref.json').write_text(json.dumps({'split_version': 'v1'}), encoding='utf-8')
+                (run / 'dataset_ref.json').write_text(json.dumps({'split_rule': 'Chronological cycles: 70/20/10'}), encoding='utf-8')
                 runs.append(run)
             output = save_test_accuracy_comparison(runs, root / 'accuracy.png')
             self.assertGreater(output.stat().st_size, 0)

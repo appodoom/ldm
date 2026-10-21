@@ -8,12 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-HITS = frozenset({
-    "HIT_S", "HIT_D", "HIT_OTA", "HIT_OTI", "HIT_PA2",
-    "HIT_D_decorated", "HIT_OTA_decorated", "HIT_PA2_decorated",
-})
-MAX_SUBDIVISION = 8
-_HIT = re.compile(r"HIT_[A-Za-z0-9]+(?:_decorated)?(?:_SKEL)?\Z")
+from .constants import (
+    HITS, MAX_SUBDIVISION, DERBAKE_LINE_COUNT,
+    GENERATED_TEMPO, GENERATED_AMPLITUDE,
+)
+
+from .validation import validate_rules
+
 _POSITIVE_INT = re.compile(r"[1-9][0-9]*\Z")
 
 
@@ -55,6 +56,13 @@ class SkeletonEvent:
 
 @dataclass(frozen=True)
 class DerbakeDocument:
+    """Parsed five-line file; cycle lengths are derived rather than duplicated.
+
+    Line 1: initial_tempo. Line 2: tempos. Line 3: rhythm.cycle_lengths.
+    Line 4: skeleton_events. Line 5: rhythm's beats/hits + variation_amplitudes.
+    By default skeleton hits overlay rhythm; audio requests overlay_skeleton=False.
+    """
+
     rhythm: RhythmSequence
     initial_tempo: float
     tempos: tuple[float, ...]
@@ -73,12 +81,9 @@ def _finite_number(text: str, *, positive: bool = False) -> float:
 
 
 def _clean_hit(token: str) -> str:
-    if not _HIT.fullmatch(token):
-        raise ValueError(f"Invalid HIT: {token!r}")
-    hit = token.removesuffix("_SKEL")
-    if hit not in HITS:
+    if token not in HITS:
         raise ValueError(f"Unsupported HIT: {token!r}")
-    return hit
+    return token
 
 
 def _parse_variation(tokens: list[str]) -> tuple[list[Beat], list[tuple[float, ...]]]:
@@ -132,7 +137,7 @@ def _parse_skeleton(tokens: list[str], beat_count: int) -> tuple[SkeletonEvent, 
 def parse_derbake(path: str | Path, *, max_beats_per_cycle: int | None = None,
                   overlay_skeleton: bool = True) -> DerbakeDocument:
     lines = Path(path).read_text(encoding="utf-8").splitlines()
-    if len(lines) != 5:
+    if len(lines) != DERBAKE_LINE_COUNT:
         raise ValueError(f"Expected exactly five physical lines; got {len(lines)}")
     initial = _finite_number(lines[0].strip(), positive=True)
     tempos = tuple(_finite_number(value, positive=True) for value in lines[1].split())
@@ -140,11 +145,13 @@ def parse_derbake(path: str | Path, *, max_beats_per_cycle: int | None = None,
     if not length_tokens or any(not _POSITIVE_INT.fullmatch(value) for value in length_tokens):
         raise ValueError("Line 3 needs positive integer cycle lengths")
     lengths = tuple(map(int, length_tokens))
-    if max_beats_per_cycle is not None and any(n > max_beats_per_cycle for n in lengths):
-        raise ValueError("Cycle exceeds model capacity")
     beats, amplitudes = _parse_variation(lines[4].split())
-    if sum(lengths) != len(beats) or len(tempos) != len(beats):
-        raise ValueError("Tempo count, cycle lengths, and variation beats disagree")
+    validate_rules({
+        "cycle_lengths": (max_beats_per_cycle is None or all(n <= max_beats_per_cycle for n in lengths),
+                          "Cycle exceeds model capacity"),
+        "beat_counts": (sum(lengths) == len(beats) == len(tempos),
+                        "Tempo count, cycle lengths, and variation beats disagree"),
+    })
     events = _parse_skeleton(lines[3].split(), len(beats))
     # Model inputs overlay skeleton hits; audio renders the two streams separately.
     normalized = [list(beat.hits) for beat in beats]
@@ -171,7 +178,7 @@ def write_derbake(rhythm: RhythmSequence, path: str | Path) -> None:
         for beat in cycle:
             parts.append(f"SUBD_{beat.subdivision}")
             for hit in beat.hits:
-                parts.extend((hit, "AMP_1.5"))
-    lines = ["120", " ".join(["120"] * rhythm.beat_count),
+                parts.extend((hit, f"AMP_{GENERATED_AMPLITUDE}"))
+    lines = [str(GENERATED_TEMPO), " ".join([str(GENERATED_TEMPO)] * rhythm.beat_count),
              " ".join(map(str, rhythm.cycle_lengths)), "", " ".join(parts)]
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")

@@ -13,43 +13,37 @@ from pathlib import Path
 from typing import Iterable
 
 from .experiment_config import RunConfig
+from .constants import PREPARATION_VERSION
+from .validation import validate_rules
 from .dataset_integrity import dataset_fingerprint, verify_dataset
 
 
-def _source_hash(ordinary: Path, decorated: Path | None) -> str:
-    files = sorted(ordinary.glob("*.derbake"))
+def _source_hash(source_dir: Path) -> str:
+    files = sorted(source_dir.glob("*.derbake"))
     if not files:
-        raise ValueError(f"No .derbake files in {ordinary}")
-    if decorated is not None and {p.name for p in files} != {p.name for p in decorated.glob("*.derbake")}:
-        raise ValueError("Ordinary and decorated filenames differ")
+        raise ValueError(f"No .derbake files in {source_dir}")
     digest = hashlib.sha256()
     for source in files:
         digest.update(source.name.encode())
         digest.update(hashlib.sha256(source.read_bytes()).digest())
-        if decorated is not None:
-            digest.update(hashlib.sha256((decorated / source.name).read_bytes()).digest())
     return digest.hexdigest()
 
 
-def prepare_or_load_dataset(config: RunConfig, ordinary: str | Path,
-                            decorated: str | Path | None, cache_root: str | Path) -> Path:
-    """Reuse arrays only when the complete recipe and source bytes match."""
+def prepare_or_load_dataset(config: RunConfig, source_dir: str | Path,
+                            cache_root: str | Path) -> Path:
+    """Prepare/reuse exactly one source for the selected subdivision/decoration axes."""
     from .dataset_ldm import prepare_dataset
     from .vocabulary import atomic_vocabulary, vocabulary_hash
 
-    ordinary = Path(ordinary)
-    decorated = Path(decorated) if config.data.include_decorated and decorated else None
-    if config.data.include_decorated and decorated is None:
-        raise ValueError("This run includes decorated data but no decorated directory was given")
-    recipe = {"variant": config.data.variant.value, "context_size": config.data.context_size,
-              "stride": config.data.resolved_stride,
+    source_dir = Path(source_dir)
+    recipe = {"variant": config.data.variant.value, "decoration": config.data.decoration.value,
+              "context_size": config.data.context_size, "stride": config.data.resolved_stride,
               "max_beats_per_cycle": config.data.max_beats_per_cycle,
-              "decorated_weight": config.data.decorated_weight if decorated else None,
-              "source_hash": _source_hash(ordinary, decorated),
+              "source_hash": _source_hash(source_dir),
               "vocab_hash": vocabulary_hash(atomic_vocabulary(config.data.variant.value)),
-              "preparation_version": 4, "split_version": "per_file_contiguous_cycles_v1"}
+              "preparation_version": PREPARATION_VERSION}
     fingerprint = hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
-    target = Path(cache_root) / f"{config.data.variant.value}-{fingerprint[:12]}"
+    target = Path(cache_root) / f"{config.data.variant.value}-{config.data.decoration.value}-{fingerprint[:12]}"
     manifest_path = target / "dataset_manifest.json"
     if manifest_path.exists():
         saved = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -62,11 +56,9 @@ def prepare_or_load_dataset(config: RunConfig, ordinary: str | Path,
     if target.exists() and any(target.iterdir()):
         raise ValueError(f"Incomplete dataset cache at {target}; inspect it before retrying")
     print(f"Preparing dataset {target}", flush=True)
-    prepare_dataset(ordinary, target, variant=config.data.variant.value,
-                    context_size=config.data.context_size,
-                    max_beats_per_cycle=config.data.max_beats_per_cycle,
-                    decorated_dir=decorated, stride=config.data.resolved_stride,
-                    decorated_weight=config.data.decorated_weight)
+    prepare_dataset(source_dir, target, variant=config.data.variant.value,
+                    decoration=config.data.decoration.value, context_size=config.data.context_size,
+                    max_beats_per_cycle=config.data.max_beats_per_cycle, stride=config.data.resolved_stride)
     return target
 
 
@@ -79,17 +71,16 @@ def model_config_for_run(run: RunConfig, dataset: str | Path):
                 "context_size": run.data.context_size,
                 "stride": run.data.resolved_stride,
                 "max_beats_per_cycle": run.data.max_beats_per_cycle,
-                "decorated_weight": (run.data.decorated_weight
-                                     if run.data.include_decorated else None)}
+                "decoration": run.data.decoration.value}
     mismatches = [key for key, value in expected.items() if manifest.get(key) != value]
-    if mismatches or bool(manifest.get("decorated_dir")) != run.data.include_decorated:
-        raise ValueError(f"Prepared dataset recipe differs from run: {mismatches or ['decorated data']}")
+    if mismatches:
+        raise ValueError(f"Prepared dataset recipe differs from run: {mismatches}")
     vocab = atomic_vocabulary(run.data.variant.value)
     maxima = {key: max(int(value[key]) for value in manifest["stats"].values())
               for key in ("max_tokens_per_beat", "max_beat_slots_per_chunk", "max_cycles_per_chunk")}
     m = run.model
     return LDMConfig(vocab_size=len(vocab), vocab_hash=vocabulary_hash(vocab),
-                     dataset_variant=run.data.variant.value,
+                     dataset_variant=run.data.variant.value, dataset_decoration=run.data.decoration.value,
                      context_size=run.data.context_size,
                      max_beats_per_cycle=run.data.max_beats_per_cycle,
                      number_of_layers=m.layers, number_of_heads=m.heads,
@@ -109,7 +100,7 @@ def make_run_id(config: RunConfig, now: datetime | None = None) -> str:
         return config.name
     now = now or datetime.now(timezone.utc)
     m, d = config.model, config.data
-    return (f"run_{now:%Y%m%d-%H%M%S}_{d.variant.value}_ctx{d.context_size}_"
+    return (f"run_{now:%Y%m%d-%H%M%S}_{d.variant.value}_{d.decoration.value}_ctx{d.context_size}_"
             f"s{d.resolved_stride}_L{m.layers}H{m.heads}E{m.embeddings}_{config.fingerprint[:8]}")
 
 
@@ -216,16 +207,17 @@ def execute_run(run_dir: str | Path, *, device: str | None = None,
     record = json.loads(path.read_text(encoding="utf-8"))
     config = RunConfig.from_dict(record["config"])
     dataset = Path(record["dataset_path"])
-    if dataset_fingerprint(dataset) != record["dataset_fingerprint"]:
-        raise ValueError("Prepared dataset fingerprint differs from run record")
-    if resume and not (run_dir / "last.pt").exists():
-        raise ValueError("No resumable last.pt in this run")
-    if not resume and (run_dir / "last.pt").exists():
-        raise ValueError("This run already has a checkpoint; use resume_run")
     kwargs = _train_kwargs(config)
+    has_checkpoint = (run_dir / "last.pt").exists()
+    validate_rules({
+        "dataset": (dataset_fingerprint(dataset) == record["dataset_fingerprint"],
+                    "Prepared dataset fingerprint differs from run record"),
+        "resume": (not resume or has_checkpoint, "No resumable last.pt in this run"),
+        "new_run": (resume or not has_checkpoint, "This run already has a checkpoint; use resume_run"),
+        "target_epochs": (target_epochs is None or target_epochs >= kwargs["epochs"],
+                          "Resume target epochs cannot be below the saved target"),
+    })
     if target_epochs is not None:
-        if target_epochs < kwargs["epochs"]:
-            raise ValueError("Resume target epochs cannot be below the saved target")
         kwargs["epochs"] = target_epochs
     record["status"] = "training"
     _write_json(path, record)
@@ -280,13 +272,13 @@ def compare_runs(run_dirs: list[str | Path]) -> list[dict]:
         record = inspect_run(path)
         metrics = record.get("metrics", {})
         reference = Path(path) / "dataset_ref.json"
-        split_version = (json.loads(reference.read_text(encoding="utf-8")).get("split_version")
-                         if reference.exists() else None)
+        split_rule = json.loads(reference.read_text(encoding="utf-8"))["split_rule"]
         rows.append({"run_id": record["run_id"], "status": record["status"],
                      "config_hash": record["config_fingerprint"],
                      "dataset_fingerprint": record["dataset_fingerprint"],
-                     "split_version": split_version,
+                     "split_rule": split_rule,
                      "variant": record["config"]["data"]["variant"],
+                     "decoration": record["config"]["data"]["decoration"],
                      "best_step": metrics.get("best_step"),
                      "val_loss": metrics.get("best_val_loss"),
                      "test_loss": metrics.get("test_loss"),
@@ -294,8 +286,8 @@ def compare_runs(run_dirs: list[str | Path]) -> list[dict]:
                      "metric_version": metrics.get("test_report", {}).get("metric_version")})
     fingerprints = {row["dataset_fingerprint"] for row in rows}
     versions = {row["metric_version"] for row in rows}
-    splits = {row["split_version"] for row in rows}
+    splits = {row["split_rule"] for row in rows}
     for row in rows:
         row["comparable"] = (len(fingerprints) == len(versions) == len(splits) == 1
-                             and row['metric_version'] is not None and row['split_version'] is not None)
+                             and row['metric_version'] is not None)
     return rows

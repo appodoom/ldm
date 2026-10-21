@@ -12,9 +12,7 @@ def split_cycle_ranges(cycle_count: int) -> dict[str, tuple[int, int]]:
         index = max(range(3), key=lambda i: (quotas[i] - counts[i], -i))
         counts[index] += 1
     while sum(counts) > cycle_count:
-        index = max((i for i in range(3) if counts[i] > 1),
-                    key=lambda i: (counts[i] - quotas[i], i))
+        index = max((i for i in range(3) if counts[i] > 1), key=lambda i: (counts[i] - quotas[i], i))
         counts[index] -= 1
     train, val, test = counts
-    return {"train": (0, train), "val": (train, train + val),
-            "test": (train + val, train + val + test)}
+    return {"train": (0, train), "val": (train, train + val), "test": (train + val, train + val + test)}

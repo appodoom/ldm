@@ -5,20 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 
-from .derbake_ldm import HITS, MAX_SUBDIVISION
-
-STRUCTURAL = ("<PAD>", "<SOC>", "<EOC>", "<SOB>", "<EOB>")
-HIT_ORDER = (
-    "HIT_S", "HIT_D", "HIT_OTA", "HIT_OTI", "HIT_PA2",
-    "HIT_D_decorated", "HIT_OTA_decorated", "HIT_PA2_decorated",
-)
-assert set(HIT_ORDER) == HITS
-
+from .constants import HIT_ORDER, STRUCTURAL, SUBDIVISION_TOKENS
 
 def atomic_vocabulary(variant: str) -> tuple[str, ...]:
     if variant not in {"with_subd", "no_subd"}:
         raise ValueError(f"Unknown variant: {variant}")
-    subd = tuple(f"SUBD_{i}" for i in range(1, MAX_SUBDIVISION + 1)) if variant == "with_subd" else ()
+    subd = SUBDIVISION_TOKENS if variant == "with_subd" else ()
     return STRUCTURAL + subd + HIT_ORDER
 
 

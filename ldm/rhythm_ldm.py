@@ -150,7 +150,9 @@ class RhythmStateTracker:
         subd_t = bool(self.rhythm_info["is_subd"][token_id])
         delim_t = bool(self.rhythm_info["is_delim"][token_id])
 
-        start_cycle = soc_t or ((not self.in_cycle) and sob_t)
+        if sob_t and not self.in_cycle:
+            raise ValueError("Beat is missing an opening <SOC>")
+        start_cycle = soc_t
         if start_cycle:
             self.in_cycle = True
         if eoc_t:
@@ -351,10 +353,7 @@ def compute_hierarchy_ids_for_sequence(
             cycle_start[position] = True
             active_beat = -1
         elif is_sob and active_cycle < 0:
-            # Tolerate legacy sequences that begin directly with <SOB>.
-            active_cycle = next_cycle_uid
-            next_cycle_uid += 1
-            cycle_start[position] = True
+            raise ValueError(f"Beat at token {position} is missing an opening <SOC>")
 
         if is_sob:
             active_beat = next_beat_uid
@@ -525,8 +524,10 @@ class StructuredGenerationTracker:
         ends_beat = bool(self.rhythm_info["is_eob"][token_id])
         ends_cycle = bool(self.rhythm_info["is_eoc"][token_id])
 
-        if starts_cycle or (starts_beat and not self.in_cycle):
-            starts_cycle = True
+        # Sampled orphan beats have no cycle identity; never invent a <SOC>.
+        starts_beat = starts_beat and (self.in_cycle or starts_cycle)
+
+        if starts_cycle:
             self.in_cycle = True
             self.in_beat = False
             self.cycle_ordinal = self.next_cycle_ordinal

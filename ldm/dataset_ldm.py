@@ -5,9 +5,11 @@ from typing import Dict, List
 import hashlib
 import numpy as np
 from .derbake_ldm import RhythmSequence, parse_derbake
+from .constants import MAX_SUBDIVISION, NORMAL_DATA, DATA_DECORATIONS, PREPARATION_VERSION, NORMALIZATION_RULE, SPLIT_RULE
 from .schema_ldm import RhythmSchema
 from .vocabulary import AtomicVocabulary, atomic_vocabulary
 from .splits import split_cycle_ranges
+from .validation import validate_rules
 from .rhythm_ldm import (STRUCTURED_ROUTING_FIELDS, count_chunks, get_chunk_starts,
     build_rhythm_lookup_arrays, compute_rhythm_ids_for_sequence,
     compute_hierarchy_ids_for_sequence, build_structured_routing_for_window,
@@ -53,7 +55,6 @@ def write_split_chunks(
     rhythm_info: Dict[str, np.ndarray],
     max_beats_per_cycle: int,
     create_target_masks: bool = False,
-    source_kinds: List[int] | None = None,
     skeleton_targets: List[List[bool]] | None = None,
     source_file_ids: List[int] | None = None,
     dtype=np.int32,
@@ -63,7 +64,6 @@ def write_split_chunks(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     out_path = out_dir / f"{split_name}.npy"
-    kind_path = out_dir / f"{split_name}_source_kind.npy"
     file_path = out_dir / f"{split_name}_source_file.npy"
     beat_idx_path = out_dir / f"{split_name}_beat_idx.npy"
     beat_pos_path = out_dir / f"{split_name}_beat_pos.npy"
@@ -78,17 +78,13 @@ def write_split_chunks(
     parsed_files = []
     total_chunks = 0
     files_with_chunks = 0
-    if source_kinds is None:
-        source_kinds = [0] * len(sequences)
-    if len(source_kinds) != len(sequences):
-        raise ValueError("Each sequence needs a source kind")
-    if source_file_ids is not None and len(source_file_ids) != len(sequences):
-        raise ValueError("Each sequence needs a source file ID")
-    if skeleton_targets is not None and (
-        len(skeleton_targets) != len(sequences)
-        or any(len(mask) != len(ids) for mask, ids in zip(skeleton_targets, sequences))
-    ):
-        raise ValueError("Skeleton target masks must match sequences")
+    validate_rules({
+        "source_file_ids": (source_file_ids is None or len(source_file_ids) == len(sequences),
+                            "Each sequence needs a source file ID"),
+        "skeleton_targets": (skeleton_targets is None or (len(skeleton_targets) == len(sequences) and
+            all(len(mask) == len(ids) for mask, ids in zip(skeleton_targets, sequences))),
+            "Skeleton target masks must match sequences"),
+    })
     for ids in sequences:
         num_chunks = count_chunks(len(ids), window_len, stride, pad)
         parsed_files.append((ids, num_chunks))
@@ -99,7 +95,6 @@ def write_split_chunks(
         empty_int = np.empty((0, window_len), dtype=np.int32)
         empty_bool = np.empty((0, window_len), dtype=bool)
         np.save(out_path, np.empty((0, window_len), dtype=dtype))
-        np.save(kind_path, np.empty(0, dtype=np.uint8))
         if source_file_ids is not None:
             np.save(file_path, np.empty(0, dtype=np.int32))
         np.save(beat_idx_path, empty_int)
@@ -126,8 +121,6 @@ def write_split_chunks(
 
     shape = (total_chunks, window_len)
     arr = np.lib.format.open_memmap(out_path, mode="w+", dtype=dtype, shape=shape)
-    kind_arr = np.lib.format.open_memmap(kind_path, mode="w+", dtype=np.uint8,
-                                         shape=(total_chunks,))
     file_arr = (np.lib.format.open_memmap(file_path, mode="w+", dtype=np.int32,
                                          shape=(total_chunks,)) if source_file_ids is not None else None)
     beat_idx_arr = np.lib.format.open_memmap(
@@ -171,7 +164,7 @@ def write_split_chunks(
         "max_cycles_per_chunk": 0,
     }
 
-    for file_index, ((ids, expected_chunks), source_kind) in enumerate(zip(parsed_files, source_kinds)):
+    for file_index, (ids, expected_chunks) in enumerate(parsed_files):
         if expected_chunks == 0:
             continue
         seq_len = len(ids)
@@ -196,7 +189,6 @@ def write_split_chunks(
             unique_hit_count_events += mask_stats["unique_hit_count_events"]
 
         for file_row, start in enumerate(chunk_starts):
-            kind_arr[row] = source_kind
             if file_arr is not None:
                 file_arr[row] = source_file_ids[file_index]
             real_end = min(start + window_len, seq_len)
@@ -236,7 +228,6 @@ def write_split_chunks(
             f"{split_name}: wrote {row} chunks but expected {total_chunks} chunks"
         )
     arr.flush()
-    kind_arr.flush()
     if file_arr is not None:
         file_arr.flush()
     beat_idx_arr.flush()
@@ -261,81 +252,62 @@ def write_split_chunks(
 
 
 def prepare_dataset(
-    ordinary_dir: str | Path, output_dir: str | Path, *, variant: str,
+    source_dir: str | Path, output_dir: str | Path, *, variant: str,
     context_size: int, max_beats_per_cycle: int,
-    decorated_dir: str | Path | None = None, stride: int | None = None,
-    decorated_weight: float = 1.0,
+    decoration: str = NORMAL_DATA, stride: int | None = None,
 ) -> dict:
-    """Create split-specific arrays, keeping paired versions on identical cycles."""
-    ordinary_dir = Path(ordinary_dir)
+    """Prepare one independent source, splitting complete cycles within each file."""
+    source_dir = Path(source_dir)
     output_dir = Path(output_dir)
-    files = sorted(ordinary_dir.glob("*.derbake"))
-    if not files:
-        raise ValueError(f"No .derbake files in {ordinary_dir}")
-    if context_size < 2:
-        raise ValueError("context_size must be at least 2")
+    files = sorted(source_dir.glob("*.derbake"))
     stride = max(1, context_size // 2) if stride is None else stride
-    if not 1 <= stride <= context_size:
-        raise ValueError("stride must be between 1 and context_size")
-    decorated = Path(decorated_dir) if decorated_dir is not None else None
-    if not np.isfinite(decorated_weight) or decorated_weight <= 0:
-        raise ValueError("decorated_weight must be positive and finite")
-    if decorated is not None and {p.name for p in files} != {p.name for p in decorated.glob("*.derbake")}:
-        raise ValueError("Ordinary and decorated filenames must match exactly")
+    validate_rules({
+        "source_dir": (bool(files), f"No .derbake files in {source_dir}"),
+        "decoration": (decoration in DATA_DECORATIONS, f"Unknown decoration mode: {decoration}"),
+        "context_size": (context_size >= 2, "must be at least 2"),
+        "stride": (1 <= stride <= context_size, "must be between 1 and context_size"),
+    })
     schema = RhythmSchema(variant, max_beats_per_cycle)
     vocab = AtomicVocabulary(atomic_vocabulary(variant))
     sequences: dict[str, list[list[int]]] = {"train": [], "val": [], "test": []}
-    source_kinds: dict[str, list[int]] = {"train": [], "val": [], "test": []}
     skeleton_masks: dict[str, list[list[bool]]] = {"train": [], "val": [], "test": []}
     file_ids: dict[str, list[int]] = {"train": [], "val": [], "test": []}
     split_files = []
     digest = hashlib.sha256()
     for source_index, source in enumerate(files):
-        documents = [parse_derbake(source, max_beats_per_cycle=max_beats_per_cycle)]
+        document = parse_derbake(source, max_beats_per_cycle=max_beats_per_cycle)
         digest.update(source.name.encode("utf-8"))
         digest.update(hashlib.sha256(source.read_bytes()).digest())
-        if decorated is not None:
-            pair = decorated / source.name
-            documents.append(parse_derbake(pair, max_beats_per_cycle=max_beats_per_cycle))
-            digest.update(hashlib.sha256(pair.read_bytes()).digest())
-            if documents[1].rhythm.cycle_lengths != documents[0].rhythm.cycle_lengths:
-                raise ValueError(f"Paired cycles differ in {source.name}")
-        ranges = split_cycle_ranges(len(documents[0].rhythm.cycles))
-        split_files.append({"file": source.name, "cycles": len(documents[0].rhythm.cycles),
+        ranges = split_cycle_ranges(len(document.rhythm.cycles))
+        split_files.append({"file": source.name, "cycles": len(document.rhythm.cycles),
                             "ranges": {key: list(value) for key, value in ranges.items()}})
-        for source_kind, document in enumerate(documents):
-            for split_name, (start, end) in ranges.items():
-                piece = RhythmSequence(document.rhythm.cycles[start:end])
-                atoms = schema.encode(piece)
-                mask = skeleton_atom_mask(document, start, end, variant)
-                if len(mask) != len(atoms):
-                    raise RuntimeError("Skeleton provenance differs from encoded atoms")
-                sequences[split_name].append(vocab.encode(atoms))
-                source_kinds[split_name].append(source_kind)
-                skeleton_masks[split_name].append(mask)
-                file_ids[split_name].append(source_index)
+        for split_name, (start, end) in ranges.items():
+            piece = RhythmSequence(document.rhythm.cycles[start:end])
+            atoms = schema.encode(piece)
+            mask = skeleton_atom_mask(document, start, end, variant)
+            if len(mask) != len(atoms):
+                raise RuntimeError("Skeleton provenance differs from encoded atoms")
+            sequences[split_name].append(vocab.encode(atoms))
+            skeleton_masks[split_name].append(mask)
+            file_ids[split_name].append(source_index)
     output_dir.mkdir(parents=True, exist_ok=True)
-    rhythm_info = build_rhythm_lookup_arrays(list(vocab.tokens), max_beat_positions=8)
+    rhythm_info = build_rhythm_lookup_arrays(list(vocab.tokens), max_beat_positions=MAX_SUBDIVISION)
     stats = {}
     for split_name, items in sequences.items():
         stats[split_name] = write_split_chunks(
             split_name, items, output_dir, context_size + 1, stride, True,
             vocab.to_id["<PAD>"], rhythm_info, max_beats_per_cycle,
-            create_target_masks=True,
-            source_kinds=source_kinds[split_name],
-            skeleton_targets=skeleton_masks[split_name],
+            create_target_masks=True, skeleton_targets=skeleton_masks[split_name],
             source_file_ids=file_ids[split_name],
         )
-    manifest = {"format_version": 2, "preparation_version": 4,
-                "normalization_version": "skeleton_overlay_v1",
-                "split_version": "per_file_contiguous_cycles_v1",
-                "variant": variant, "vocab_hash": vocab.hash,
-                "ordinary_dir": str(ordinary_dir),
-                "decorated_dir": str(decorated) if decorated else None,
+    manifest = {"preparation_version": PREPARATION_VERSION,
+                "normalization_rule": NORMALIZATION_RULE,
+                "split_rule": SPLIT_RULE,
+                "variant": variant, "decoration": decoration, "vocab_hash": vocab.hash,
+                "source_dir": str(source_dir),
                 "context_size": context_size, "stride": stride,
                 "max_beats_per_cycle": max_beats_per_cycle,
                 "source_hash": digest.hexdigest(), "files": split_files, "stats": stats}
-    manifest["decorated_weight"] = decorated_weight if decorated else None
     from .dataset_integrity import seal_dataset
     seal_dataset(output_dir, manifest)
     return manifest

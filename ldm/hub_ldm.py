@@ -44,7 +44,8 @@ def build_local_snapshot(run_dir: str | Path, output_dir: str | Path) -> dict:
             raise RuntimeError(f"Snapshot changed checkpoint tensor {name}")
     payload = {"source_checkpoint_sha256": hashlib.sha256((run_dir / "best.pt").read_bytes()).hexdigest(),
                "dataset_fingerprint": checkpoint["dataset_fingerprint"],
-               "dataset_variant": config.dataset_variant, "vocab_hash": config.vocab_hash,
+               "dataset_variant": config.dataset_variant, "dataset_decoration": config.dataset_decoration,
+               "vocab_hash": config.vocab_hash,
                "derbake_format_version": config.derbake_format_version,
                "token_schema_version": config.token_schema_version,
                "source_epoch": checkpoint["epoch"], "source_val_loss": checkpoint["val_loss"]}
@@ -58,7 +59,7 @@ def build_local_snapshot(run_dir: str | Path, output_dir: str | Path) -> dict:
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         payload["metric_version"] = metrics.get("test_report", {}).get("metric_version")
     dataset_ref = json.loads((run_dir / "dataset_ref.json").read_text(encoding="utf-8"))
-    payload["split_version"] = dataset_ref.get("split_version")
+    payload["split_rule"] = dataset_ref.get("split_rule")
     metadata = output_dir / "metadata"
     metadata.mkdir()
     for name in ("run_config.json", "dataset_ref.json"):
@@ -81,7 +82,7 @@ tags:
 - derbake
 ---
 
-# LDM {config.dataset_variant}
+# LDM {config.dataset_variant} ({config.dataset_decoration})
 
 This snapshot uses atomic rhythm tokens and five-line `.derbake` files.
 It was built from a selected training checkpoint. `trust_remote_code=True`

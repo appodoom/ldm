@@ -9,14 +9,15 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .constants import DATA_DECORATIONS
+
 
 def _prepare(args):
     from .dataset_ldm import prepare_dataset
-    result = prepare_dataset(args.ordinary, args.output, variant=args.variant,
+    result = prepare_dataset(args.source, args.output, variant=args.variant,
                              context_size=args.context_size,
                              max_beats_per_cycle=args.max_beats_per_cycle,
-                             decorated_dir=args.decorated, stride=args.stride,
-                             decorated_weight=args.decorated_weight)
+                             decoration=args.decoration, stride=args.stride)
     print(json.dumps(result["stats"], indent=2))
 
 
@@ -29,7 +30,8 @@ def _train(args):
     maxima = {key: max(int(value[key]) for value in manifest["stats"].values())
               for key in ("max_tokens_per_beat", "max_beat_slots_per_chunk", "max_cycles_per_chunk")}
     config = LDMConfig(vocab_size=len(vocab), vocab_hash=vocabulary_hash(vocab),
-                       dataset_variant=manifest["variant"], context_size=manifest["context_size"],
+                       dataset_variant=manifest["variant"], dataset_decoration=manifest["decoration"],
+                       context_size=manifest["context_size"],
                        max_beats_per_cycle=manifest["max_beats_per_cycle"],
                        number_of_layers=args.layers, number_of_heads=args.heads,
                        number_of_embeddings=args.embeddings, mlp_ratio=args.mlp_ratio,
@@ -70,7 +72,7 @@ def _experiment(args):
         print(json.dumps(compare_runs(args.runs), indent=2))
     elif args.action == "start":
         config = RunConfig.from_dict(json.loads(args.config.read_text(encoding="utf-8")))
-        dataset = prepare_or_load_dataset(config, args.ordinary, args.decorated, args.cache_root)
+        dataset = prepare_or_load_dataset(config, args.source, args.cache_root)
         run = start_run(config, dataset, args.runs_root, device=args.device)
         print(f"Run: {run}")
     elif args.action == "resume":
@@ -82,14 +84,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="python -m ldm.cli")
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare")
-    prepare.add_argument("--ordinary", type=Path, required=True)
-    prepare.add_argument("--decorated", type=Path)
+    prepare.add_argument("--source", type=Path, required=True)
+    prepare.add_argument("--decoration", choices=DATA_DECORATIONS, required=True)
     prepare.add_argument("--output", type=Path, required=True)
     prepare.add_argument("--variant", choices=("with_subd", "no_subd"), required=True)
     prepare.add_argument("--context-size", type=int, default=1024)
     prepare.add_argument("--max-beats-per-cycle", type=int, default=16)
     prepare.add_argument("--stride", type=int)
-    prepare.add_argument("--decorated-weight", type=float, default=1.0)
     prepare.set_defaults(handler=_prepare)
     training = commands.add_parser("train")
     training.add_argument("--dataset", type=Path, required=True)
@@ -127,8 +128,7 @@ def main(argv=None):
     actions = experiment.add_subparsers(dest="action", required=True)
     start = actions.add_parser("start")
     start.add_argument("--config", type=Path, required=True)
-    start.add_argument("--ordinary", type=Path, required=True)
-    start.add_argument("--decorated", type=Path)
+    start.add_argument("--source", type=Path, required=True)
     start.add_argument("--cache-root", type=Path, required=True)
     start.add_argument("--runs-root", type=Path, required=True)
     start.add_argument("--device")

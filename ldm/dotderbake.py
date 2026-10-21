@@ -8,6 +8,7 @@ import numpy as np
 
 from .config import AudioSamples
 from .derbake_ldm import parse_derbake
+from .validation import validate_rules
 
 
 def apply_cross_fade(hit_audio: np.ndarray, fade_samples: int = 500) -> np.ndarray:
@@ -26,10 +27,10 @@ def render_wav(derbake_path: str | Path, sample_dirs: dict[str, str | Path],
                output_path: str | Path, *, sample_rate: int = 48000,
                seed: int = 1337, skeleton_gain: float = 3.0) -> Path:
     """Mix variation and skeleton events without overlaying either stream twice."""
-    if sample_rate < 8000:
-        raise ValueError("sample_rate must be at least 8000")
-    if not np.isfinite(skeleton_gain) or skeleton_gain < 0:
-        raise ValueError("skeleton_gain must be finite and nonnegative")
+    validate_rules({
+        "sample_rate": (sample_rate >= 8000, "must be at least 8000"),
+        "skeleton_gain": (np.isfinite(skeleton_gain) and skeleton_gain >= 0, "must be finite and nonnegative"),
+    })
     try:
         import soundfile as sf
     except ImportError as exc:

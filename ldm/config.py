@@ -8,12 +8,7 @@ from pathlib import Path
 import numpy as np
 
 
-HIT_FOLDERS = {
-    "HIT_D": "doums",
-    "HIT_OTA": "taks",
-    "HIT_OTI": "tiks",
-    "HIT_PA2": "pa2s",
-}
+from .constants import HITS, HIT_FOLDERS, DECORATED_SUFFIX, SILENT_HIT
 
 
 class AudioSamples:
@@ -27,12 +22,12 @@ class AudioSamples:
         self.audio: dict[Path, np.ndarray] = {}
 
     def get_audio_data(self, hit: str) -> tuple[Path, np.ndarray] | None:
-        if hit == "HIT_S":
-            return None
-        decorated = hit.endswith("_decorated")
-        base = hit.removesuffix("_decorated")
-        if base not in HIT_FOLDERS:
+        if hit not in HITS:
             raise ValueError(f"Unsupported audio HIT: {hit}")
+        if hit == SILENT_HIT:
+            return None
+        decorated = hit.endswith(DECORATED_SUFFIX)
+        base = hit.removesuffix(DECORATED_SUFFIX)
         group = "decorated_hits" if decorated else "normal_hits"
         if group not in self.roots:
             raise ValueError(f"Missing sample root: {group}")

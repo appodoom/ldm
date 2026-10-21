@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from .derbake_ldm import Beat, HITS, MAX_SUBDIVISION, RhythmSequence
+from .derbake_ldm import Beat, RhythmSequence
+from .constants import HITS, SUBDIVISION_TOKENS
 
 
-_SUBDIVISIONS = {f"SUBD_{size}": size for size in range(1, MAX_SUBDIVISION + 1)}
+_SUBDIVISIONS = {token: size for size, token in enumerate(SUBDIVISION_TOKENS, 1)}
 
 
 class RhythmSchema:

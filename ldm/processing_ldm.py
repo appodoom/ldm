@@ -9,6 +9,8 @@ import torch
 from transformers import AutoTokenizer, ProcessorMixin
 from transformers.utils.hub import cached_file
 
+from .validation import validate_rules  # HF caches only direct relative imports.
+from .constants import HITS  # HF caches only direct relative imports.
 from .derbake_ldm import RhythmSequence, parse_derbake, write_derbake
 from .schema_ldm import RhythmSchema
 from .tokenization_ldm import LDMTokenizer

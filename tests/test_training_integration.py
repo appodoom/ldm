@@ -14,7 +14,7 @@ class TrainingIntegrationTests(unittest.TestCase):
         import torch
         from unittest.mock import patch
         from ldm.derbake_ldm import Beat, RhythmSequence, write_derbake
-        from ldm.experiment_config import RunConfig, DataConfig, ModelConfig, TrainConfig, EvalConfig, AttentionLayout
+        from ldm.experiment_config import RunConfig, DataConfig, ModelConfig, TrainConfig, EvalConfig, AttentionLayout, DecorationMode
         from ldm.experiment_workflow import prepare_or_load_dataset, model_config_for_run, _train_kwargs
         from ldm.train_ldm import train, _save
         old_threads = torch.get_num_threads()
@@ -26,12 +26,12 @@ class TrainingIntegrationTests(unittest.TestCase):
                 source.mkdir()
                 write_derbake(RhythmSequence(tuple((Beat(2, ('HIT_D', 'HIT_S')),)
                                                    for _ in range(20))), source / 'a.derbake')
-                config = RunConfig(data=DataConfig(context_size=16, stride=8, max_beats_per_cycle=4, include_decorated=False),
+                config = RunConfig(data=DataConfig(context_size=16, stride=8, max_beats_per_cycle=4, decoration=DecorationMode.WITHOUT_DECORATION),
                     model=ModelConfig(layers=1, heads=2, embeddings=16, mlp_ratio=2,
                                       dropout=0.2, attention=AttentionLayout.GLOBAL),
                     train=TrainConfig(epochs=2, batch_size=2, amp=False, save_every_steps=1, log_every_steps=50),
                     evaluation=EvalConfig(batch_size=2, every_steps=100))
-                dataset = prepare_or_load_dataset(config, source, None, root / 'cache')
+                dataset = prepare_or_load_dataset(config, source, root / 'cache')
                 model_config = model_config_for_run(config, dataset)
                 kwargs = _train_kwargs(config)
                 uninterrupted = train(dataset, root / 'full', model_config, **kwargs, device='cpu')
@@ -58,11 +58,11 @@ class TrainingIntegrationTests(unittest.TestCase):
         finally:
             torch.set_num_threads(old_threads)
 
-    def test_both_variants_train_resume_and_export_analyses(self):
+    def test_all_data_modes_train_resume_export_and_generate(self):
         import torch
         from ldm.derbake_ldm import Beat, RhythmSequence, write_derbake
         from ldm.experiment_config import (RunConfig, DataConfig, ModelConfig, TrainConfig,
-                                           EvalConfig, DatasetVariant, AttentionLayout)
+                                           EvalConfig, DatasetVariant, AttentionLayout, DecorationMode)
         from ldm.experiment_workflow import prepare_or_load_dataset, start_run, resume_run
         from ldm.hub_ldm import build_local_snapshot
         from ldm.embedding_analysis import EmbeddingRepresentation, analyze_static_embeddings
@@ -75,25 +75,28 @@ class TrainingIntegrationTests(unittest.TestCase):
                 for group, hit in (('normal', 'HIT_D'), ('decorated', 'HIT_D_decorated')):
                     (root / group).mkdir()
                     rhythm = RhythmSequence(tuple((Beat(2, (hit, 'HIT_S')),
-                                                    Beat(1, ('HIT_OTA',))) for _ in range(10)))
-                    write_derbake(rhythm, root / group / 'a.derbake')
-                for variant, layout in ((DatasetVariant.WITH_SUBD, AttentionLayout.ALTERNATING_GLOBAL_STRUCTURED),
-                                         (DatasetVariant.NO_SUBD, AttentionLayout.GLOBAL)):
-                    config = RunConfig(data=DataConfig(variant=variant, context_size=32, stride=16,
+                                                    Beat(1, ('HIT_OTA',))) for _ in range(10 if group == "normal" else 12)))
+                    write_derbake(rhythm, root / group / f'{group}_only.derbake')
+                from itertools import product
+                for (variant, layout), decoration in product(
+                        ((DatasetVariant.WITH_SUBD, AttentionLayout.ALTERNATING_GLOBAL_STRUCTURED),
+                         (DatasetVariant.NO_SUBD, AttentionLayout.GLOBAL)), DecorationMode):
+                    config = RunConfig(data=DataConfig(variant=variant, decoration=decoration, context_size=32, stride=16,
                                                        max_beats_per_cycle=4),
                         model=ModelConfig(layers=2, heads=2, embeddings=16, mlp_ratio=2,
                                           dropout=0, attention=layout),
                         train=TrainConfig(epochs=1, batch_size=2, amp=False, log_every_steps=2,
                                           save_every_steps=2),
                         evaluation=EvalConfig(batch_size=2, every_steps=2))
-                    data = prepare_or_load_dataset(config, root / 'normal', root / 'decorated', root / 'cache')
+                    data = prepare_or_load_dataset(config, root / decoration.value, root / 'cache')
                     run = start_run(config, data, root / 'runs', device='cpu')
                     self.assertTrue(json.loads((run / 'model_checks.json').read_text())['passed'])
                     runtime = json.loads((run / 'runtime_settings.json').read_text())
                     self.assertEqual(runtime['num_workers'], 0)
                     self.assertFalse(runtime['amp'])
                     first = json.loads((run / 'metrics.json').read_text())
-                    self.assertEqual(first['test_report']['metric_version'], 2)
+                    self.assertEqual(first['test_report']['metric_version'], 3)
+                    self.assertEqual(first['test_report']['decoration'], decoration.value)
                     self.assertIn('correct_plain_hit', first['test_report']['combined']['decorated_outcomes'])
                     record = json.loads((run / 'experiment.json').read_text())
                     record['last_error'] = 'older failed attempt'
@@ -101,8 +104,10 @@ class TrainingIntegrationTests(unittest.TestCase):
                     resumed = resume_run(run, target_epochs=2, device='cpu')
                     self.assertNotIn('last_error', json.loads((run / 'experiment.json').read_text()))
                     self.assertGreater(resumed['steps'], first['steps'])
-                    snapshot = root / 'snapshots' / variant.value
+                    snapshot = root / 'snapshots' / f'{variant.value}-{decoration.value}'
                     build_local_snapshot(run, snapshot)
+                    self.assertTrue((snapshot / "constants.py").exists())
+                    self.assertTrue((snapshot / "validation.py").exists())
                     reports = analyze_static_embeddings(snapshot, run / 'analysis',
                         representations=list(EmbeddingRepresentation), top_k=3)
                     self.assertEqual(len(reports), 3)
@@ -126,7 +131,10 @@ class TrainingIntegrationTests(unittest.TestCase):
                     # Long orphan prefix forces a cache refresh, followed by an invalid
                     # cycle and one accepted cycle. Sampling alone is scripted.
                     from ldm.schema_ldm import RhythmSchema
-                    atoms = ['<PAD>'] * 32 + ['<SOC>', '<EOC>'] + RhythmSchema(variant.value, 4).encode(expected)
+                    oversized = RhythmSequence(((Beat(1, ('HIT_D',)),) * 5,))
+                    atoms = (['<SOB>', 'HIT_D', '<EOB>', '<PAD>'] * 8 + ['<SOC>', '<EOC>']
+                             + RhythmSchema(variant.value, 8).encode(oversized)
+                             + RhythmSchema(variant.value, 4).encode(expected))
                     sampled = iter(model.vocab.index(atom) for atom in atoms)
                     generation_module = importlib.import_module(model.__class__.__module__)
                     generator = inspect.unwrap(generation_module.generate_continuation_ids)
@@ -135,10 +143,10 @@ class TrainingIntegrationTests(unittest.TestCase):
                          patch.dict(generator.__globals__, {'sample_next_id': lambda **kwargs: next(sampled)}), \
                          warnings.catch_warnings(record=True) as caught:
                         report = run_inference(snapshot, prompt, root / 'inference',
-                            InferenceConfig(num_cycles=1, max_new_tokens=64, cache_refresh_tokens=8))
+                            InferenceConfig(num_cycles=1, max_new_tokens=128, cache_refresh_tokens=8))
                     self.assertEqual(parse_derbake(report['output']).rhythm, expected)
                     self.assertEqual(report['generation']['accepted_cycles'], 1)
-                    self.assertEqual(report['generation']['discarded_cycles'], 1)
+                    self.assertEqual(report['generation']['discarded_cycles'], 2)
                     self.assertEqual(report['generation']['orphan_tokens'], 32)
                     self.assertTrue(any('skipped' in str(w.message) for w in caught))
                     self.assertTrue((Path(report['output']).parent / 'report.json').exists())

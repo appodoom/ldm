@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .rhythm_ldm import STRUCTURED_ROUTING_FIELDS
+from .constants import PREPARATION_VERSION
 
 
 def _sha256(path: Path) -> str:
@@ -25,7 +26,6 @@ def _expected_arrays(manifest: dict) -> dict:
         rows = manifest['stats'][split]['chunks']
         width = manifest['context_size'] + 1
         shapes = {'': ((rows, width), 'int32'),
-                  '_source_kind': ((rows,), 'uint8'),
                   '_source_file': ((rows,), 'int32'),
                   '_beat_idx': ((rows, width), 'int32'),
                   '_beat_pos': ((rows, width), 'int32')}
@@ -58,7 +58,6 @@ def _inventory(folder: Path, manifest: dict) -> dict:
 def seal_dataset(folder: str | Path, manifest: dict) -> None:
     """Record the completed payload only after all arrays have been written."""
     folder = Path(folder)
-    manifest['integrity_version'] = 1
     manifest['artifacts'] = _inventory(folder, manifest)
     target = folder / 'dataset_manifest.json'
     temporary = target.with_suffix('.json.tmp')
@@ -68,12 +67,13 @@ def seal_dataset(folder: str | Path, manifest: dict) -> None:
 
 def dataset_fingerprint(folder: str | Path) -> str:
     manifest = json.loads((Path(folder) / 'dataset_manifest.json').read_text(encoding='utf-8'))
-    if manifest.get('integrity_version') != 1 or 'artifacts' not in manifest:
-        raise ValueError('Prepared dataset has no content inventory. Reprepare data for new runs; '
-                         'resuming an older run requires a verified dataset migration')
+    if manifest.get('preparation_version') != PREPARATION_VERSION:
+        raise ValueError('Prepared dataset uses a different preparation version. Prepare a new dataset with the current code.')
+    if 'artifacts' not in manifest:
+        raise ValueError('Prepared dataset has no content inventory. Prepare the dataset again.')
     # Local paths do not change the identity of identical, verified data.
     stable = {key: value for key, value in manifest.items()
-              if key not in {'ordinary_dir', 'decorated_dir'}}
+              if key != 'source_dir'}
     return hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
@@ -83,7 +83,8 @@ def verify_dataset(folder: str | Path, *, model_config: dict | None = None) -> s
     manifest = json.loads((folder / 'dataset_manifest.json').read_text(encoding='utf-8'))
     if model_config is not None:
         fields = {'variant': 'dataset_variant', 'vocab_hash': 'vocab_hash',
-                  'context_size': 'context_size', 'max_beats_per_cycle': 'max_beats_per_cycle'}
+                  'context_size': 'context_size', 'max_beats_per_cycle': 'max_beats_per_cycle',
+                  'decoration': 'dataset_decoration'}
         differences = [key for key, model_key in fields.items()
                        if manifest[key] != model_config.get(model_key)]
         if model_config.get('attention_layout') == 'alternating_global_structured':

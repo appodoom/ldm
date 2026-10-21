@@ -10,6 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .validation import validate_rules
+
 
 @dataclass(frozen=True)
 class InferenceConfig:
@@ -22,12 +24,15 @@ class InferenceConfig:
     cache_refresh_tokens: int = 256
 
     def __post_init__(self):
-        if min(self.num_cycles, self.max_new_tokens, self.cache_refresh_tokens) < 1:
-            raise ValueError("Cycle and token limits must be positive")
-        if self.top_k < 0 or not math.isfinite(self.temperature) or self.temperature < 0:
-            raise ValueError("Invalid sampling settings")
-        if not math.isfinite(self.top_p) or not 0 < self.top_p <= 1:
-            raise ValueError("top_p must be in (0, 1]")
+        validate_rules({
+            "num_cycles": (self.num_cycles >= 1, "must be positive"),
+            "max_new_tokens": (self.max_new_tokens >= 1, "must be positive"),
+            "cache_refresh_tokens": (self.cache_refresh_tokens >= 1, "must be positive"),
+            "top_k": (self.top_k >= 0, "must be nonnegative"),
+            "temperature": (math.isfinite(self.temperature) and self.temperature >= 0,
+                            "must be nonnegative and finite"),
+            "top_p": (math.isfinite(self.top_p) and 0 < self.top_p <= 1, "must be finite in (0, 1]"),
+        })
 
 
 def run_inference(snapshot: str | Path, prompt: str | Path,

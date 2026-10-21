@@ -9,6 +9,7 @@ from .rhythm_ldm import (build_rhythm_lookup_arrays, RhythmStateTracker,
     StructuredGenerationTracker, structured_step_to_tensors)
 from .schema_ldm import RhythmSchema
 from .cycle_collector import CycleCollector
+from .validation import validate_rules
 
 def top_k_filter(logits: torch.Tensor, k: int) -> torch.Tensor:
     if k <= 0 or k >= logits.numel():
@@ -74,12 +75,11 @@ def generate_continuation_ids(
     cache_refresh_tokens: int = 256,
 ) -> tuple[List[int], dict]:
     """Generate with one-token updates for both global and structured caches."""
-    if max_new_tokens < 1:
-        raise ValueError("max_new_tokens must be positive")
-    if not prompt_ids:
-        raise ValueError("prompt_ids cannot be empty")
-    if cache_refresh_tokens < 1:
-        raise ValueError("cache_refresh_tokens must be >= 1")
+    validate_rules({
+        "max_new_tokens": (max_new_tokens >= 1, "must be positive"),
+        "prompt_ids": (bool(prompt_ids), "cannot be empty"),
+        "cache_refresh_tokens": (cache_refresh_tokens >= 1, "must be positive"),
+    })
 
     device = next(model.parameters()).device
     model.eval()
@@ -89,6 +89,10 @@ def generate_continuation_ids(
         generator.manual_seed(seed)
 
     all_ids = list(prompt_ids)
+    pad_id = vocab.index("<PAD>")
+    # Keep sampled tokens unchanged for the model and collector. Orphan or
+    # excess beat markers are neutral only in metadata, including cache rebuilds.
+    hierarchy_ids = list(prompt_ids)
     collector = CycleCollector(schema, num_cycles)
     rhythm_info = build_rhythm_lookup_arrays(
         vocab, max_beat_positions=model.max_beat_positions
@@ -122,7 +126,7 @@ def generate_continuation_ids(
         routing_tensor = None
         structured_tracker = None
         if model.has_structured_layers:
-            hierarchy = compute_hierarchy_ids_for_sequence(all_ids, rhythm_info)
+            hierarchy = compute_hierarchy_ids_for_sequence(hierarchy_ids, rhythm_info)
             routing, _ = build_structured_routing_for_window(
                 hierarchy=hierarchy,
                 start=context_start,
@@ -148,9 +152,9 @@ def generate_continuation_ids(
                     if matching_starts.size:
                         replay_start = int(matching_starts[0])
             structured_tracker = StructuredGenerationTracker(rhythm_info)
-            for token_id in all_ids[replay_start:context_start]:
+            for token_id in hierarchy_ids[replay_start:context_start]:
                 structured_tracker.append(token_id, visible_to_cache=False)
-            for token_id in all_ids[context_start:]:
+            for token_id in hierarchy_ids[context_start:]:
                 structured_tracker.append(token_id, visible_to_cache=True)
 
         return (
@@ -185,13 +189,20 @@ def generate_continuation_ids(
             top_p=top_p,
             generator=generator,
         )
+        hierarchy_id = next_id
+        if rhythm_info["is_sob"][next_id] and (
+            not rhythm_tracker.in_cycle or
+            (rhythm_tracker.started and rhythm_tracker.beat + 1 >= model.max_beats_per_cycle)
+        ):
+            hierarchy_id = pad_id
+        hierarchy_ids.append(hierarchy_id)
         all_ids.append(next_id)
         done = collector.append(next_id, vocab[next_id])
-        next_beat_idx, next_beat_pos = rhythm_tracker.append(next_id)
+        next_beat_idx, next_beat_pos = rhythm_tracker.append(hierarchy_id)
         all_beat_idx.append(next_beat_idx)
         all_beat_pos.append(next_beat_pos)
         structured_step = (
-            structured_step_to_tensors(structured_tracker.append(next_id), device)
+            structured_step_to_tensors(structured_tracker.append(hierarchy_id), device)
             if structured_tracker is not None
             else None
         )

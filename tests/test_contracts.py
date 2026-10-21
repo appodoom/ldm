@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import json
 import sys
 import types
 import unittest
@@ -18,7 +19,7 @@ from ldm.schema_ldm import RhythmSchema
 from ldm.splits import split_cycle_ranges
 from ldm.vocabulary import AtomicVocabulary, atomic_vocabulary
 from ldm.dataset_ldm import prepare_dataset
-from ldm.experiment_config import DataConfig, DatasetVariant, RunConfig
+from ldm.experiment_config import DataConfig, DatasetVariant, DecorationMode, RunConfig
 from ldm.experiment_workflow import check_run_name, make_run_id, prepare_or_load_dataset
 from ldm.inference_ldm import InferenceConfig
 from ldm.dotderbake import render_wav
@@ -40,6 +41,29 @@ class CliDispatchTests(unittest.TestCase):
 
 
 class DerbakeContractTests(unittest.TestCase):
+    def test_hierarchy_requires_cycle_start_before_each_beat(self):
+        from ldm.rhythm_ldm import build_rhythm_lookup_arrays, compute_hierarchy_ids_for_sequence
+        vocab = list(atomic_vocabulary("no_subd"))
+        lookup = build_rhythm_lookup_arrays(vocab, max_beat_positions=8)
+        def ids(tokens):
+            return [vocab.index(token) for token in tokens]
+        cycle = ["<SOC>", "<SOB>", "HIT_D", "<EOB>", "<EOC>"]
+        for tokens in (cycle[1:], cycle + cycle[1:]):
+            with self.subTest(tokens=tokens), self.assertRaisesRegex(ValueError, "opening <SOC>"):
+                compute_hierarchy_ids_for_sequence(ids(tokens), lookup)
+        hierarchy = compute_hierarchy_ids_for_sequence(ids(cycle + cycle), lookup)
+        self.assertEqual(hierarchy["cycle_uid"].tolist(), [0] * 5 + [1] * 5)
+        from ldm.rhythm_ldm import StructuredGenerationTracker, RhythmStateTracker
+        with self.assertRaisesRegex(ValueError, "opening <SOC>"):
+            RhythmStateTracker(lookup, 4).append(vocab.index("<SOB>"))
+        tracker = StructuredGenerationTracker(lookup)
+        step = tracker.append(vocab.index("<SOB>"))
+        self.assertFalse(step["starts_cycle"])
+        self.assertFalse(step["starts_beat"])
+        self.assertFalse(step["in_beat"])
+        # An unfinished prefix is valid while autoregressive generation is in progress.
+        compute_hierarchy_ids_for_sequence(ids(cycle[:-2]), lookup)
+
     def test_optional_wav_renderer_and_sampling_validation(self):
         with self.assertRaises(ValueError):
             InferenceConfig(top_p=0)
@@ -112,13 +136,13 @@ class DerbakeContractTests(unittest.TestCase):
     def test_typed_run_config_round_trip_and_cache_recipe(self):
         config = RunConfig("demo", data=DataConfig(
             variant=DatasetVariant.NO_SUBD, context_size=16, stride=8,
-            include_decorated=False))
+            decoration=DecorationMode.WITHOUT_DECORATION))
         self.assertEqual(RunConfig.from_dict(config.to_dict()), config)
         self.assertEqual(make_run_id(config), "demo")
         automatic = replace(config, name=None)
         self.assertEqual(automatic.fingerprint, config.fingerprint)
         self.assertRegex(make_run_id(automatic, datetime(2026, 10, 20, tzinfo=timezone.utc)),
-                         r"^run_20261020-000000_no_subd_ctx16_s8_L4H4E256_[0-9a-f]{8}$")
+                         r"^run_20261020-000000_no_subd_normal_ctx16_s8_L4H4E256_[0-9a-f]{8}$")
         with self.assertRaises(TypeError):
             RunConfig("bad", data=replace(config.data, variant="no_subd"))
         rhythm = RhythmSequence(tuple((Beat(1, ("HIT_D",)),) for _ in range(10)))
@@ -132,10 +156,10 @@ class DerbakeContractTests(unittest.TestCase):
             source = root / "normal"
             source.mkdir()
             write_derbake(rhythm, source / "one.derbake")
-            first = prepare_or_load_dataset(config, source, None, root / "cache")
-            self.assertEqual(first, prepare_or_load_dataset(config, source, None, root / "cache"))
+            first = prepare_or_load_dataset(config, source, root / "cache")
+            self.assertEqual(first, prepare_or_load_dataset(config, source, root / "cache"))
             changed = replace(config, data=replace(config.data, context_size=24))
-            self.assertNotEqual(first, prepare_or_load_dataset(changed, source, None, root / "cache"))
+            self.assertNotEqual(first, prepare_or_load_dataset(changed, source, root / "cache"))
 
     def test_skeleton_target_mask_is_scored_once(self):
         rhythm = RhythmSequence(tuple((Beat(1, ("HIT_D",)),) for _ in range(10)))
@@ -146,7 +170,7 @@ class DerbakeContractTests(unittest.TestCase):
             path = source / "one.derbake"
             write_derbake(rhythm, path)
             lines = path.read_text(encoding="utf-8").splitlines()
-            lines[3] = "DELAY_0 HIT_D_SKEL DEV_0"
+            lines[3] = "DELAY_0 HIT_D DEV_0"
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             prepare_dataset(source, root / "prepared", variant="with_subd",
                             context_size=8, max_beats_per_cycle=16, stride=4)
@@ -182,7 +206,7 @@ class DerbakeContractTests(unittest.TestCase):
     def test_skeleton_override_and_bad_counts(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
             path = Path(folder) / "prompt.derbake"
-            path.write_text("120\n120 120\n2\nDELAY_0 HIT_D_SKEL DEV_0\n"
+            path.write_text("120\n120 120\n2\nDELAY_0 HIT_D DEV_0\n"
                             "SUBD_1 HIT_S AMP_1 SUBD_1 HIT_OTA AMP_1\n", encoding="utf-8")
             rhythm = parse_derbake(path).rhythm
             self.assertEqual(rhythm.cycles[0][0].hits, ("HIT_D",))
@@ -240,31 +264,74 @@ class DerbakeContractTests(unittest.TestCase):
         self.assertEqual(split_cycle_ranges(100),
                          {"train": (0, 70), "val": (70, 90), "test": (90, 100)})
 
-    def test_preparation_splits_each_paired_file_before_chunking(self):
-        ordinary = RhythmSequence(tuple((Beat(1, ("HIT_D",)),) for _ in range(10)))
-        decorated = RhythmSequence(tuple((Beat(1, ("HIT_D_decorated",)),) for _ in range(10)))
+    def test_notebook_downloads_independent_and_decorated_only_sources(self):
+        notebook = json.loads((Path(__file__).resolve().parents[1] / "notebooks" / "ldm_training.ipynb").read_text())
+        code = next("".join(cell["source"]) for cell in notebook["cells"]
+                    if cell["cell_type"] == "code" and "SELECT_DATA_COLLECTIONS = {" in "".join(cell["source"]))
+        code = code.replace("'five-line'", "'normal-source'", 1).replace("'five-line'", "'decorated-source'", 1)
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
             root = Path(folder)
-            (root / "ordinary").mkdir()
+            normal = "normal-source/normal/a.derbake"
+            decorated = ["decorated-source/decorated/b.derbake", "decorated-source/decorated/c.derbake"]
+            for name in [normal, *decorated]:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            downloads = []
+            def download(**kwargs):
+                downloads.append(kwargs['allow_patterns'])
+                return str(root)
+            def environment():
+                return {"Path": Path, "project": root, "DATA_REPO_ID": "test/data", "DATA_COMMIT": "test-sha",
+                        "DATA_COLLECTIONS": {"normal-source": {"normal": [normal]},
+                                             "decorated-source": {"decorated": decorated}}}
+            with patch.dict(sys.modules, {"huggingface_hub": types.SimpleNamespace(snapshot_download=download)}):
+                scope = environment()
+                exec(code, scope)
+                self.assertEqual(set(scope['DATA_SOURCES']), set(DecorationMode))
+                self.assertEqual(set(downloads[-1]), {normal, *decorated})
+                scope['SELECT_DATA_COLLECTIONS'][DecorationMode.WITHOUT_DECORATION] = None
+                self.assertNotEqual(scope['current_data_selection'](), scope['SELECTED_DATA_SOURCE'])
+                scope = environment()
+                exec(code.replace("DecorationMode.WITHOUT_DECORATION: 'normal-source'",
+                                  "DecorationMode.WITHOUT_DECORATION: None"), scope)
+                self.assertEqual(set(scope['DATA_SOURCES']), {DecorationMode.WITH_DECORATION})
+                self.assertEqual(set(downloads[-1]), set(decorated))
+
+    def test_preparation_uses_independent_sources_and_splits_each_file(self):
+        normal = RhythmSequence(tuple((Beat(1, ("HIT_D",)),) for _ in range(10)))
+        decorated = RhythmSequence(tuple((Beat(1, ("HIT_D_decorated",)),) for _ in range(12)))
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
+            root = Path(folder)
+            (root / "normal").mkdir()
             (root / "decorated").mkdir()
-            write_derbake(ordinary, root / "ordinary" / "one.derbake")
-            write_derbake(decorated, root / "decorated" / "one.derbake")
-            for variant in ("with_subd", "no_subd"):
-                destination = root / variant
-                manifest = prepare_dataset(root / "ordinary", destination,
-                    variant=variant, context_size=16, max_beats_per_cycle=16,
-                    decorated_dir=root / "decorated")
-                self.assertEqual(manifest["files"][0]["ranges"],
-                                 {"train": [0, 7], "val": [7, 9], "test": [9, 10]})
-                for split in ("train", "val", "test"):
-                    self.assertEqual(manifest["stats"][split]["sequences_seen"], 2)
-                    self.assertGreater(manifest["stats"][split]["unique_targets"], 0)
-                    self.assertEqual(np.load(destination / f"{split}.npy").shape[0],
-                                     manifest["stats"][split]["chunks"])
-                    self.assertEqual(set(np.load(destination / f"{split}_source_kind.npy")),
-                                     {0, 1})
-                    self.assertEqual(set(np.load(destination / f"{split}_source_file.npy")),
-                                     {0})
+            write_derbake(normal, root / "normal" / "normal_only.derbake")
+            write_derbake(decorated, root / "decorated" / "unrelated.derbake")
+            caches = []
+            for variant in DatasetVariant:
+                for mode in DecorationMode:
+                    config = RunConfig(data=DataConfig(variant=variant, decoration=mode,
+                                                        context_size=16, max_beats_per_cycle=16))
+                    destination = prepare_or_load_dataset(config, root / mode.value, root / "cache")
+                    self.assertEqual(destination, prepare_or_load_dataset(config, root / mode.value, root / "cache"))
+                    caches.append(destination)
+                    manifest = json.loads((destination / "dataset_manifest.json").read_text())
+                    from ldm.constants import PREPARATION_VERSION, NORMALIZATION_RULE, SPLIT_RULE
+                    self.assertEqual(manifest["preparation_version"], PREPARATION_VERSION)
+                    self.assertEqual(manifest["normalization_rule"], NORMALIZATION_RULE)
+                    self.assertEqual(manifest["split_rule"], SPLIT_RULE)
+                    self.assertIn("artifacts", manifest)
+                    self.assertTrue({"format_version", "normalization_version", "split_version",
+                                     "integrity_version"}.isdisjoint(manifest))
+                    self.assertEqual(manifest["decoration"], mode.value)
+                    self.assertEqual(manifest["files"][0]["cycles"], 10 if mode is DecorationMode.WITHOUT_DECORATION else 12)
+                    self.assertEqual(manifest["files"][0]["file"], "normal_only.derbake" if mode is DecorationMode.WITHOUT_DECORATION else "unrelated.derbake")
+                    for split in ("train", "val", "test"):
+                        self.assertEqual(manifest["stats"][split]["sequences_seen"], 1)
+                        self.assertGreater(manifest["stats"][split]["unique_targets"], 0)
+                        self.assertEqual(set(np.load(destination / f"{split}_source_file.npy")), {0})
+                        self.assertFalse((destination / f"{split}_source_kind.npy").exists())
+            self.assertEqual(len(set(caches)), 4)
 
 
 if __name__ == "__main__":

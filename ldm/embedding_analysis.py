@@ -9,6 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .constants import DECORATED_SUFFIX
+
 
 class EmbeddingRepresentation(str, Enum):
     TOKEN_ONLY = 'token_only'
@@ -19,7 +21,7 @@ class EmbeddingRepresentation(str, Enum):
 def _group(token: str) -> str:
     if token.startswith('SUBD_'):
         return 'subdivision'
-    if token.endswith('_decorated'):
+    if token.endswith(DECORATED_SUFFIX):
         return 'decorated_hit'
     if token.startswith('HIT_'):
         return 'hit'

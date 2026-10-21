@@ -2,6 +2,8 @@
 
 import numpy as np
 
+from .constants import DECORATED_SUFFIX
+
 
 def _ratio(numerator: int | float, denominator: int | float):
     return float(numerator / denominator) if denominator else None
@@ -37,9 +39,9 @@ class TokenCounts:
         self.hit_ids = np.array([tok.startswith("HIT_") for tok in vocab])
         self.structure_ids = np.array([tok in {"<SOC>", "<EOC>", "<SOB>", "<EOB>"}
                                        or tok.startswith("SUBD_") for tok in vocab])
-        self.decorated_ids = np.array([tok.endswith("_decorated") for tok in vocab])
-        self.plain_ids = np.array([vocab.index(tok.removesuffix('_decorated'))
-                                   if tok.endswith('_decorated') and tok.removesuffix('_decorated') in vocab
+        self.decorated_ids = np.array([tok.endswith(DECORATED_SUFFIX) for tok in vocab])
+        self.plain_ids = np.array([vocab.index(tok.removesuffix(DECORATED_SUFFIX))
+                                   if tok.endswith(DECORATED_SUFFIX) and tok.removesuffix(DECORATED_SUFFIX) in vocab
                                    else -1 for tok in vocab])
 
     def add(self, targets: np.ndarray, predictions: np.ndarray, losses: np.ndarray,
@@ -105,7 +107,7 @@ class TokenCounts:
                 weighted_recall += support * r
                 weighted_f1 += support * f
         ornament_by_type = {token: per_token[token] for token in self.vocab
-                            if token.endswith("_decorated")}
+                            if token.endswith(DECORATED_SUFFIX)}
         structure_by_type = {token: per_token[token] for token in self.vocab
                              if token in {"<SOC>", "<EOC>", "<SOB>", "<EOB>"}
                              or token.startswith("SUBD_")}
@@ -121,6 +123,7 @@ class TokenCounts:
             "hit_count_total": self.hit_count_total,
             "decorated_accuracy": _ratio(self.decorated_correct, self.decorated_total),
             "decorated_wrong_type": self.decorated_wrong_type,
+            "decorated_wrong_type_rate": _ratio(self.decorated_wrong_type, self.decorated_total),
             "decorated_plain_hit_correct": self.decorated_plain_correct,
             "decorated_plain_hit_accuracy": _ratio(self.decorated_plain_correct, self.decorated_total),
             "decorated_outcomes": {'total': self.decorated_total,

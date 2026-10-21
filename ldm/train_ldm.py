@@ -17,6 +17,7 @@ from .evaluation_ldm import evaluate_model
 from .modeling_ldm import LDMModel
 from .data_loading import ChunkDataset, chunk_loader, batch_to_device
 from .dataset_integrity import verify_dataset
+from .validation import validate_rules
 
 
 def _rng_state() -> dict:
@@ -55,22 +56,27 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
     # Transformers updates runtime fields on config during model construction.
     # Keep the caller's experiment settings unchanged across independent runs.
     config = deepcopy(config)
-    if num_workers < 0 or prefetch_factor < 1:
-        raise ValueError("Invalid data-loader worker count or prefetch factor")
     dataset_dir = Path(dataset_dir)
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_bytes = (dataset_dir / "dataset_manifest.json").read_bytes()
     manifest = json.loads(manifest_bytes)
     fingerprint = verify_dataset(dataset_dir, model_config=config.to_dict())
-    eval_batch_size = eval_batch_size or batch_size
-    eval_every_steps = eval_every_steps or 0
-    if min(epochs, batch_size, eval_batch_size, save_every_steps, log_every_steps) < 1 or learning_rate <= 0:
-        raise ValueError("Training counts and learning rate must be positive")
+    eval_batch_size = batch_size if eval_batch_size is None else eval_batch_size
+    eval_every_steps = 0 if eval_every_steps is None else eval_every_steps
+    validate_rules({
+        **{name: (value >= 1, "must be positive") for name, value in {
+            "epochs": epochs, "batch_size": batch_size, "eval_batch_size": eval_batch_size,
+            "save_every_steps": save_every_steps, "log_every_steps": log_every_steps,
+            "prefetch_factor": prefetch_factor}.items()},
+        "num_workers": (num_workers >= 0, "must be nonnegative"),
+        "eval_every_steps": (eval_every_steps >= 0, "must be nonnegative"),
+        "learning_rate": (math.isfinite(learning_rate) and learning_rate > 0, "must be positive and finite"),
+    })
     run_config = {"dataset_fingerprint": fingerprint, "model_config": config.to_dict(),
                   "batch_size": batch_size, "learning_rate": learning_rate,
                   "seed": seed, "save_every_steps": save_every_steps,
-                  "decorated_weight": manifest.get("decorated_weight")}
+                  "decoration": manifest["decoration"]}
     new_controls = {"eval_batch_size": eval_batch_size, "eval_every_steps": eval_every_steps,
                     "weight_decay": weight_decay, "grad_clip": grad_clip, "amp": amp, "allow_tf32": allow_tf32,
                     "max_steps": max_steps, "max_train_time_minutes": max_train_time_minutes,
@@ -85,20 +91,20 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
         # JSON turns integer dictionary keys (for example id2label) into strings.
         # Compare the saved file to the same serialized representation.
         saved_config = json.loads(run_config_path.read_text(encoding="utf-8"))
-        for key, value in saved_config.items():
-            if key in run_config and value != json.loads(json.dumps(run_config[key])):
-                raise ValueError(f"Resume setting differs: {key}")
-        if "controls" in saved_config and {"allow_tf32": True, **saved_config["controls"]} != new_controls:
-            raise ValueError("Resume training controls differ from the original run")
+        rules = {key: (value == json.loads(json.dumps(run_config[key])), f"Resume setting differs: {key}")
+                 for key, value in saved_config.items() if key in run_config}
+        rules["controls"] = ("controls" not in saved_config or
+            {"allow_tf32": True, **saved_config["controls"]} == new_controls,
+            "Resume training controls differ from the original run")
+        validate_rules(rules)
     elif run_config_path.exists() or (run_dir / "last.pt").exists():
         raise ValueError("Run directory already contains a run; use --resume or another path")
     else:
         run_config["controls"] = new_controls
         run_config_path.write_text(json.dumps(run_config, indent=2) + "\n", encoding="utf-8")
         dataset_ref = {key: manifest[key] for key in
-                       ("format_version", "preparation_version", "normalization_version", "integrity_version",
-                        "split_version", "variant", "vocab_hash",
-                        "source_hash", "decorated_weight", "context_size", "stride",
+                       ("preparation_version", "normalization_rule", "split_rule", "variant", "vocab_hash",
+                        "source_hash", "decoration", "context_size", "stride",
                         "max_beats_per_cycle")}
         (run_dir / "dataset_ref.json").write_text(json.dumps(dataset_ref, indent=2) + "\n",
                                                   encoding="utf-8")
@@ -219,14 +225,7 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
         for epoch in range(epoch_start, epochs) if stop_reason == "completed" else ():
             epoch_started = time.perf_counter()
             generator = torch.Generator().manual_seed(seed + epoch)
-            decorated_weight = manifest.get("decorated_weight") or 1.0
-            if decorated_weight == 1.0:
-                order = torch.randperm(len(train_data), generator=generator).tolist()
-            else:
-                weights = torch.as_tensor(np.where(np.asarray(train_data.source_kind) == 1,
-                                                   decorated_weight, 1.0), dtype=torch.double)
-                order = torch.multinomial(weights, len(train_data), replacement=True,
-                                          generator=generator).tolist()
+            order = torch.randperm(len(train_data), generator=generator).tolist()
             batches = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
             print(f"Epoch {epoch + 1}/{epochs}: {len(batches)} batches", flush=True)
             logged_loss = 0.0

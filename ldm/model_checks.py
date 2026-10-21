@@ -10,6 +10,7 @@ import torch
 
 from .derbake_ldm import Beat, RhythmSequence
 from .schema_ldm import RhythmSchema
+from .validation import validate_rules
 from .rhythm_ldm import (build_rhythm_lookup_arrays, compute_hierarchy_ids_for_sequence,
                          compute_rhythm_ids_for_sequence, build_structured_routing_for_window,
                          StructuredGenerationTracker, structured_step_to_tensors)
@@ -267,27 +268,28 @@ def compare_profiles(baseline: dict, candidate: dict) -> dict:
     keys = ('profile_version', 'device_name', 'torch_version', 'cuda_version', 'dataset_fingerprint',
             'batch_size', 'context_size', 'amp', 'warmup_steps', 'measured_steps',
             'device_capability', 'allow_tf32', 'cudnn_allow_tf32', 'matmul_precision', 'sdpa_backends')
-    if any(key not in report for report in (baseline, candidate) for key in (*keys, 'config', 'mean_step_ms', 'peak_allocated_gib')):
-        raise ValueError('Profiles are incomplete; create both with the current profiler')
-    differences = [key for key in keys if baseline[key] != candidate[key]]
+    required = (*keys, 'config', 'mean_step_ms', 'peak_allocated_gib')
+    validate_rules({'profiles': (all(key in report for report in (baseline, candidate) for key in required),
+                                'Profiles are incomplete; create both with the current profiler')})
     model_keys = ('number_of_layers', 'number_of_heads', 'number_of_embeddings', 'mlp_ratio',
                   'dropout', 'position_encoding', 'rope_theta', 'rope_fraction', 'tie_weights',
                   'use_type_embeddings', 'concat_type_embeddings', 'dataset_variant', 'vocab_hash',
-                  'activation_name', 'max_beat_positions', 'max_beats_per_cycle', 'max_tokens_per_beat',
-                  'max_beat_slots_per_chunk', 'max_cycles_per_chunk')
-    differences += [f'config.{key}' for key in model_keys
-                    if baseline['config'].get(key) != candidate['config'].get(key)]
-    if any(key not in report['config'] for report in (baseline, candidate) for key in model_keys):
-        differences.append('incomplete model configuration')
-    if baseline['config']['attention_layout'] != 'global':
-        differences.append('baseline must use global attention')
-    if candidate['config']['attention_layout'] != 'alternating_global_structured':
-        differences.append('candidate must use structured attention')
-    if differences:
-        raise ValueError(f'Profiles are not comparable: {differences}')
-    if any(not np.isfinite(report[key]) or report[key] <= 0
-           for report in (baseline, candidate) for key in ('mean_step_ms', 'peak_allocated_gib')):
-        raise ValueError('Profile timing and memory must be finite and positive')
+                  'activation_name', 'dataset_decoration', 'max_beat_positions', 'max_beats_per_cycle', 'max_tokens_per_beat',
+                  'max_beat_slots_per_chunk', 'max_cycles_per_chunk', 'attention_layout')
+    validate_rules({'config': (all(key in report['config'] for report in (baseline, candidate) for key in model_keys),
+                              'Profiles contain incomplete model configuration')})
+    validate_rules({
+        **{key: (baseline[key] == candidate[key], f'Profiles are not comparable: {key}') for key in keys},
+        **{f'config.{key}': (baseline['config'][key] == candidate['config'][key],
+                            f'Profiles are not comparable: config.{key}')
+           for key in model_keys if key != 'attention_layout'},
+        'baseline': (baseline['config']['attention_layout'] == 'global', 'baseline must use global attention'),
+        'candidate': (candidate['config']['attention_layout'] == 'alternating_global_structured',
+                      'candidate must use structured attention'),
+        'measurements': (all(np.isfinite(report[key]) and report[key] > 0
+                             for report in (baseline, candidate) for key in ('mean_step_ms', 'peak_allocated_gib')),
+                         'Profile timing and memory must be finite and positive'),
+    })
     step = candidate['mean_step_ms'] / baseline['mean_step_ms']
     memory = candidate['peak_allocated_gib'] / max(baseline['peak_allocated_gib'], 1e-12)
     return {'structured_to_global_step_time': step, 'structured_to_global_peak_memory': memory,
