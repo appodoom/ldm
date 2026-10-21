@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from .configuration_ldm import LDMConfig
-from .evaluation_ldm import evaluate_model, print_evaluation_metrics
+from .evaluation_ldm import evaluate_model, format_percentage, print_evaluation_metrics
 from .modeling_ldm import LDMModel
 from .data_loading import ChunkDataset, chunk_loader, batch_to_device
 from .dataset_integrity import verify_dataset
@@ -322,5 +322,7 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
               "best_step": best_step, "test_loss": test_loss, "steps": step,
               "stop_reason": stop_reason, "history": history, "test_report": test_report}
     (run_dir / "metrics.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    print(f"Test loss {test_loss:.4f}; metrics saved to {run_dir / 'metrics.json'}", flush=True)
+    print(f"Test loss {test_loss:.4f} | Test accuracy "
+          f"{format_percentage(test_report['combined']['token_accuracy'])}; "
+          f"metrics saved to {run_dir / 'metrics.json'}", flush=True)
     return result
