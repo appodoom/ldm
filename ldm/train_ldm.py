@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import math
 import random
@@ -14,54 +15,8 @@ import torch
 from .configuration_ldm import LDMConfig
 from .evaluation_ldm import evaluate_model
 from .modeling_ldm import LDMModel
-from .rhythm_ldm import STRUCTURED_ROUTING_FIELDS
-
-
-class ChunkDataset:
-    def __init__(self, folder: str | Path, split: str):
-        folder = Path(folder)
-        self.ids = np.load(folder / f"{split}.npy", mmap_mode="r")
-        self.source_kind = np.load(folder / f"{split}_source_kind.npy", mmap_mode="r")
-        file_path = folder / f"{split}_source_file.npy"
-        self.source_file = np.load(file_path, mmap_mode="r") if file_path.exists() else None
-        self.file_names = [entry["file"] for entry in json.loads(
-            (folder / "dataset_manifest.json").read_text(encoding="utf-8"))["files"]]
-        self.beat_idx = np.load(folder / f"{split}_beat_idx.npy", mmap_mode="r")
-        self.beat_pos = np.load(folder / f"{split}_beat_pos.npy", mmap_mode="r")
-        self.score = np.load(folder / f"{split}_score_mask.npy", mmap_mode="r")
-        self.hit_count = np.load(folder / f"{split}_hit_count_mask.npy", mmap_mode="r")
-        skeleton_path = folder / f"{split}_skeleton_mask.npy"
-        self.skeleton = np.load(skeleton_path, mmap_mode="r") if skeleton_path.exists() else None
-        self.routing = {field: np.load(folder / f"{split}_{field}.npy", mmap_mode="r")
-                        for field in STRUCTURED_ROUTING_FIELDS}
-        if not all(len(array) == len(self.ids) for array in
-                   (self.source_kind, self.beat_idx, self.beat_pos, self.score,
-                    self.hit_count, *self.routing.values())):
-            raise ValueError("Prepared array row counts disagree")
-        if self.skeleton is not None and len(self.skeleton) != len(self.ids):
-            raise ValueError("Skeleton mask row count disagrees")
-        if self.source_file is not None and len(self.source_file) != len(self.ids):
-            raise ValueError("Source-file row count disagrees")
-
-    def __len__(self):
-        return len(self.ids)
-
-    def batch(self, rows, device: torch.device):
-        rows = list(map(int, rows))
-        tokens = torch.as_tensor(np.asarray(self.ids[rows]), dtype=torch.long, device=device)
-        labels = tokens[:, 1:].clone()
-        score = torch.as_tensor(np.asarray(self.score[rows]), dtype=torch.bool, device=device)
-        labels[~score] = -100
-        routing = {field: torch.as_tensor(np.asarray(array[rows, :-1]),
-                                          dtype=torch.bool if field.endswith("_mask") else torch.long,
-                                          device=device)
-                   for field, array in self.routing.items()}
-        return {"input_ids": tokens[:, :-1], "labels": labels,
-                "beat_idx_ids": torch.as_tensor(np.asarray(self.beat_idx[rows, :-1]),
-                                                dtype=torch.long, device=device),
-                "beat_pos_ids": torch.as_tensor(np.asarray(self.beat_pos[rows, :-1]),
-                                                dtype=torch.long, device=device),
-                "structured_routing": routing}
+from .data_loading import ChunkDataset, chunk_loader, batch_to_device
+from .dataset_integrity import verify_dataset
 
 
 def _rng_state() -> dict:
@@ -89,21 +44,25 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
           save_every_steps: int = 200, log_every_steps: int = 50, resume: bool = False,
           device: str | None = None, eval_batch_size: int | None = None,
           eval_every_steps: int | None = None, weight_decay: float | None = None,
-          grad_clip: float | None = None, amp: bool = True,
+          grad_clip: float | None = None, amp: bool = True, allow_tf32: bool = True,
+          num_workers: int = 2, pin_memory: bool = True,
+          persistent_workers: bool = True, prefetch_factor: int = 2,
           max_steps: int | None = None, max_train_time_minutes: float | None = None,
           stop_on_nonfinite_loss: bool = True, divergence_threshold: float | None = None,
           early_stopping: bool = False, early_stopping_patience: int = 5,
           early_stopping_min_delta: float = 0.001,
           early_stopping_warmup_evals: int = 0) -> dict:
+    # Transformers updates runtime fields on config during model construction.
+    # Keep the caller's experiment settings unchanged across independent runs.
+    config = deepcopy(config)
+    if num_workers < 0 or prefetch_factor < 1:
+        raise ValueError("Invalid data-loader worker count or prefetch factor")
     dataset_dir = Path(dataset_dir)
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_bytes = (dataset_dir / "dataset_manifest.json").read_bytes()
     manifest = json.loads(manifest_bytes)
-    import hashlib
-    fingerprint = hashlib.sha256(manifest_bytes).hexdigest()
-    if manifest["variant"] != config.dataset_variant or manifest["vocab_hash"] != config.vocab_hash:
-        raise ValueError("Dataset variant/vocabulary differs from model config")
+    fingerprint = verify_dataset(dataset_dir, model_config=config.to_dict())
     eval_batch_size = eval_batch_size or batch_size
     eval_every_steps = eval_every_steps or 0
     if min(epochs, batch_size, eval_batch_size, save_every_steps, log_every_steps) < 1 or learning_rate <= 0:
@@ -113,7 +72,7 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
                   "seed": seed, "save_every_steps": save_every_steps,
                   "decorated_weight": manifest.get("decorated_weight")}
     new_controls = {"eval_batch_size": eval_batch_size, "eval_every_steps": eval_every_steps,
-                    "weight_decay": weight_decay, "grad_clip": grad_clip, "amp": amp,
+                    "weight_decay": weight_decay, "grad_clip": grad_clip, "amp": amp, "allow_tf32": allow_tf32,
                     "max_steps": max_steps, "max_train_time_minutes": max_train_time_minutes,
                     "stop_on_nonfinite_loss": stop_on_nonfinite_loss,
                     "divergence_threshold": divergence_threshold,
@@ -129,7 +88,7 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
         for key, value in saved_config.items():
             if key in run_config and value != json.loads(json.dumps(run_config[key])):
                 raise ValueError(f"Resume setting differs: {key}")
-        if "controls" in saved_config and saved_config["controls"] != new_controls:
+        if "controls" in saved_config and {"allow_tf32": True, **saved_config["controls"]} != new_controls:
             raise ValueError("Resume training controls differ from the original run")
     elif run_config_path.exists() or (run_dir / "last.pt").exists():
         raise ValueError("Run directory already contains a run; use --resume or another path")
@@ -137,7 +96,7 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
         run_config["controls"] = new_controls
         run_config_path.write_text(json.dumps(run_config, indent=2) + "\n", encoding="utf-8")
         dataset_ref = {key: manifest[key] for key in
-                       ("format_version", "preparation_version", "normalization_version",
+                       ("format_version", "preparation_version", "normalization_version", "integrity_version",
                         "split_version", "variant", "vocab_hash",
                         "source_hash", "decorated_weight", "context_size", "stride",
                         "max_beats_per_cycle")}
@@ -155,6 +114,19 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
     model = LDMModel(config).to(device)
+    from .model_core import configure_global_flash, configure_cuda_precision
+    precision = configure_cuda_precision(device, allow_tf32=allow_tf32)
+    attention_backend = configure_global_flash(model.core, amp=amp)
+    (run_dir / "attention_backend.json").write_text(
+        json.dumps(attention_backend, indent=2), encoding="utf-8")
+    runtime = {"device": str(device), **precision, "amp": device.type == "cuda" and amp,
+               "grad_scaler": device.type == "cuda" and amp,
+               "num_workers": num_workers if device.type == "cuda" else 0,
+               "pin_memory": pin_memory and device.type == "cuda",
+               "persistent_workers": persistent_workers and num_workers > 0 and device.type == "cuda",
+               "prefetch_factor": prefetch_factor if num_workers > 0 and device.type == "cuda" else None}
+    (run_dir / "runtime_settings.json").write_text(json.dumps(runtime, indent=2), encoding="utf-8")
+    print(f"[runtime] {json.dumps(runtime)}", flush=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
                                   weight_decay=0.01 if weight_decay is None else weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and amp)
@@ -181,11 +153,20 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
             scaler.load_state_dict(checkpoint["scaler"])
         _restore_rng(checkpoint["rng"])
         epoch_start, batch_start, step = checkpoint["epoch"], checkpoint["batch"], checkpoint["step"]
+        if epochs < epoch_start + int(batch_start > 0):
+            raise ValueError("Target epochs cannot be below the checkpoint's completed or active epoch")
         best = checkpoint["best_val_loss"]
         history = checkpoint["history"]
         eval_events = checkpoint.get("eval_events", 0)
         stale_evals = checkpoint.get("stale_evals", 0)
         best_step = checkpoint.get("best_step")
+    session_start_step = step
+    from .model_checks import validate_core
+    print('Checking attention caches, causality, padding, and disabled streams...', flush=True)
+    checks = validate_core(model.core, list(model.vocab), config.dataset_variant)
+    checks.update(device=str(device), torch_version=torch.__version__)
+    (run_dir / 'model_checks.json').write_text(json.dumps(checks, indent=2) + '\n', encoding='utf-8')
+    print('Model correctness checks passed', flush=True)
     def save_last(epoch_number: int, next_batch: int) -> None:
         _save(checkpoint_path, {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(), "rng": _rng_state(), "config": config.to_dict(),
@@ -213,6 +194,11 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
             stale_evals += 1
         print(f"Validation loss {val_loss:.4f} | accuracy {report['combined']['token_accuracy']:.4f} "
               f"| best {best:.4f}", flush=True)
+        outcomes = report['combined']['decorated_outcomes']
+        if outcomes['total']:
+            print(f"Decoration outcomes ({outcomes['total']} targets): exact={outcomes['exact_decorated']}, "
+                  f"wrong decorated type={outcomes['wrong_decorated_type']}, "
+                  f"correct plain hit={outcomes['correct_plain_hit']}, other={outcomes['other']}", flush=True)
         return bool(early_stopping and stale_evals >= early_stopping_patience)
     print(f"Training {config.dataset_variant} on {device}: "
           f"{len(train_data)} train, {len(val_data)} validation, "
@@ -221,98 +207,117 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
     if resume:
         print(f"Resuming at epoch {epoch_start + 1}, batch {batch_start + 1}, "
               f"global step {step}", flush=True)
-    for epoch in range(epoch_start, epochs):
-        epoch_started = time.perf_counter()
-        generator = torch.Generator().manual_seed(seed + epoch)
-        decorated_weight = manifest.get("decorated_weight") or 1.0
-        if decorated_weight == 1.0:
-            order = torch.randperm(len(train_data), generator=generator).tolist()
-        else:
-            weights = torch.as_tensor(np.where(np.asarray(train_data.source_kind) == 1,
-                                               decorated_weight, 1.0), dtype=torch.double)
-            order = torch.multinomial(weights, len(train_data), replacement=True,
-                                      generator=generator).tolist()
-        batches = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
-        print(f"Epoch {epoch + 1}/{epochs}: {len(batches)} batches", flush=True)
-        logged_loss = 0.0
-        logged_targets = 0
-        last_evaluation_step = -1
-        last_batch = -1
-        for batch_number in range(batch_start if epoch == epoch_start else 0, len(batches)):
-            last_batch = batch_number
-            model.train()
-            batch = train_data.batch(batches[batch_number], device)
-            target_count = int((batch["labels"] != -100).sum().item())
-            if not target_count:
-                continue
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, enabled=device.type == "cuda" and amp):
-                loss = model(**batch).loss
-            if not math.isfinite(float(loss.detach().item())):
-                if stop_on_nonfinite_loss:
-                    save_last(epoch, batch_number)
-                    raise FloatingPointError(f"Nonfinite training loss at step {step}")
-            scaler.scale(loss).backward()
-            if grad_clip is not None and grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            step += 1
-            logged_loss += float(loss.detach().item()) * target_count
-            logged_targets += target_count
-            if step % log_every_steps == 0 or batch_number + 1 == len(batches):
-                window_loss = logged_loss / logged_targets
-                elapsed = max(time.perf_counter() - started, 1)
-                memory_gib = (torch.cuda.max_memory_allocated(device) / 2**30
-                              if device.type == "cuda" else None)
-                print(f"Epoch {epoch + 1}/{epochs} batch {batch_number + 1}/{len(batches)} "
-                      f"step {step} | train loss {window_loss:.4f} "
-                      f"| elapsed {time.perf_counter() - epoch_started:.0f}s "
-                      f"| {step / elapsed:.2f} steps/s" +
-                      (f" | GPU {memory_gib:.2f} GiB"
-                       if device.type == "cuda" else ""), flush=True)
-                with (run_dir / "training_history.jsonl").open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps({"epoch": epoch + 1, "step": step,
-                                             "loss": window_loss, "targets": logged_targets,
-                                             "elapsed_seconds": elapsed,
-                                             "gpu_memory_gib": memory_gib}) + "\n")
-                logged_loss = 0.0
-                logged_targets = 0
-            if step % save_every_steps == 0:
-                save_last(epoch, batch_number + 1)
-                print(f"Saved resume checkpoint at step {step}", flush=True)
-            if eval_every_steps and step % eval_every_steps == 0:
-                should_stop = validate(epoch + 1)
-                last_evaluation_step = step
-                save_last(epoch, batch_number + 1)
-                if should_stop:
-                    stop_reason = "early_stopped"
+    pending_batches = []
+    loader = chunk_loader(train_data, pending_batches, device=device, num_workers=num_workers,
+                         pin_memory=pin_memory, persistent_workers=persistent_workers,
+                         prefetch_factor=prefetch_factor, seed=seed)
+    if max_steps is not None and step >= max_steps:
+        stop_reason = "max_steps"
+        print(f"Maximum steps already reached ({step}); skipping updates", flush=True)
+    batch_iterator = None
+    try:
+        for epoch in range(epoch_start, epochs) if stop_reason == "completed" else ():
+            epoch_started = time.perf_counter()
+            generator = torch.Generator().manual_seed(seed + epoch)
+            decorated_weight = manifest.get("decorated_weight") or 1.0
+            if decorated_weight == 1.0:
+                order = torch.randperm(len(train_data), generator=generator).tolist()
+            else:
+                weights = torch.as_tensor(np.where(np.asarray(train_data.source_kind) == 1,
+                                                   decorated_weight, 1.0), dtype=torch.double)
+                order = torch.multinomial(weights, len(train_data), replacement=True,
+                                          generator=generator).tolist()
+            batches = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
+            print(f"Epoch {epoch + 1}/{epochs}: {len(batches)} batches", flush=True)
+            logged_loss = 0.0
+            logged_targets = 0
+            last_evaluation_step = -1
+            last_batch = -1
+            first_batch = batch_start if epoch == epoch_start else 0
+            pending_batches[:] = batches[first_batch:]
+            batch_iterator = iter(loader)
+            for batch_number, cpu_batch in enumerate(batch_iterator, start=first_batch):
+                last_batch = batch_number
+                model.train()
+                batch = batch_to_device(cpu_batch, device)
+                target_count = int((batch["labels"] != -100).sum().item())
+                if not target_count:
+                    continue
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type=device.type, enabled=device.type == "cuda" and amp):
+                    loss = model(**batch).loss
+                if not math.isfinite(float(loss.detach().item())):
+                    if stop_on_nonfinite_loss:
+                        save_last(epoch, batch_number)
+                        raise FloatingPointError(f"Nonfinite training loss at step {step}")
+                scaler.scale(loss).backward()
+                if grad_clip is not None and grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                step += 1
+                logged_loss += float(loss.detach().item()) * target_count
+                logged_targets += target_count
+                if step % log_every_steps == 0 or batch_number + 1 == len(batches):
+                    window_loss = logged_loss / logged_targets
+                    elapsed = max(time.perf_counter() - started, 1)
+                    memory_gib = (torch.cuda.max_memory_allocated(device) / 2**30
+                                  if device.type == "cuda" else None)
+                    print(f"Epoch {epoch + 1}/{epochs} batch {batch_number + 1}/{len(batches)} "
+                          f"step {step} | train loss {window_loss:.4f} "
+                          f"| elapsed {time.perf_counter() - epoch_started:.0f}s "
+                          f"| {(step - session_start_step) / elapsed:.2f} steps/s" +
+                          (f" | GPU {memory_gib:.2f} GiB"
+                           if device.type == "cuda" else ""), flush=True)
+                    with (run_dir / "training_history.jsonl").open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps({"epoch": epoch + 1, "step": step,
+                                                 "loss": window_loss, "targets": logged_targets,
+                                                 "elapsed_seconds": elapsed,
+                                                 "gpu_memory_gib": memory_gib}) + "\n")
+                    logged_loss = 0.0
+                    logged_targets = 0
+                if step % save_every_steps == 0:
+                    save_last(epoch, batch_number + 1)
+                    print(f"Saved resume checkpoint at step {step}", flush=True)
+                if eval_every_steps and step % eval_every_steps == 0:
+                    should_stop = validate(epoch + 1)
+                    last_evaluation_step = step
+                    save_last(epoch, batch_number + 1)
+                    if should_stop:
+                        stop_reason = "early_stopped"
+                        break
+                if divergence_threshold is not None and float(loss.detach().item()) > divergence_threshold:
+                    stop_reason = "diverged"
+                elif max_steps is not None and step >= max_steps:
+                    stop_reason = "max_steps"
+                elif max_train_time_minutes is not None and time.perf_counter() - started >= 60 * max_train_time_minutes:
+                    stop_reason = "max_train_time"
+                if stop_reason != "completed":
+                    save_last(epoch, batch_number + 1)
                     break
-            if divergence_threshold is not None and float(loss.detach().item()) > divergence_threshold:
-                stop_reason = "diverged"
-            elif max_steps is not None and step >= max_steps:
-                stop_reason = "max_steps"
-            elif max_train_time_minutes is not None and time.perf_counter() - started >= 60 * max_train_time_minutes:
-                stop_reason = "max_train_time"
             if stop_reason != "completed":
-                save_last(epoch, batch_number + 1)
+                if last_evaluation_step != step:
+                    validate(epoch + 1)
+                save_last(epoch, last_batch + 1)
+                print(f"Stopped: {stop_reason} at epoch {epoch + 1}, step {step}", flush=True)
                 break
-        if stop_reason != "completed":
-            if last_evaluation_step != step:
-                validate(epoch + 1)
-            save_last(epoch, last_batch + 1)
-            print(f"Stopped: {stop_reason} at epoch {epoch + 1}, step {step}", flush=True)
-            break
-        batch_start = 0
-        if last_evaluation_step != step and validate(epoch + 1):
-            stop_reason = "early_stopped"
-        save_last(epoch + 1, 0)
-        print(f"Epoch {epoch + 1}/{epochs} complete "
-              f"| best {best:.4f} | elapsed {time.perf_counter() - epoch_started:.0f}s",
-              flush=True)
-        if stop_reason != "completed":
-            break
+            batch_start = 0
+            if last_evaluation_step != step and validate(epoch + 1):
+                stop_reason = "early_stopped"
+            save_last(epoch + 1, 0)
+            print(f"Epoch {epoch + 1}/{epochs} complete "
+                  f"| best {best:.4f} | elapsed {time.perf_counter() - epoch_started:.0f}s",
+                  flush=True)
+            if stop_reason != "completed":
+                break
+    finally:
+        # DataLoader has no public close method. Explicit shutdown also covers
+        # exceptions whose traceback still holds the active worker iterator.
+        shutdown = getattr(batch_iterator, "_shutdown_workers", None)
+        if shutdown is not None:
+            shutdown()
+        del loader
     print("Evaluating best checkpoint on test split...", flush=True)
     best_checkpoint = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
     model.load_state_dict(best_checkpoint["model"], strict=True)

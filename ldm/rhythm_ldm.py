@@ -47,19 +47,6 @@ def get_chunk_starts(
     return starts
 
 
-def iter_chunk_specs(
-    seq_len: int,
-    window_len: int,
-    stride: int,
-    pad: bool = True,
-):
-    """Yield chunk bounds and padding metadata from the canonical chunk layout."""
-    for start in get_chunk_starts(seq_len, window_len, stride, pad):
-        end = min(start + window_len, seq_len)
-        pad_count = max(0, window_len - (end - start))
-        yield start, end, pad_count, pad_count > 0
-
-
 def count_chunks(
     seq_len: int,
     window_len: int,

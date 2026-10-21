@@ -129,7 +129,8 @@ def _parse_skeleton(tokens: list[str], beat_count: int) -> tuple[SkeletonEvent, 
     return tuple(events)
 
 
-def parse_derbake(path: str | Path, *, max_beats_per_cycle: int | None = None) -> DerbakeDocument:
+def parse_derbake(path: str | Path, *, max_beats_per_cycle: int | None = None,
+                  overlay_skeleton: bool = True) -> DerbakeDocument:
     lines = Path(path).read_text(encoding="utf-8").splitlines()
     if len(lines) != 5:
         raise ValueError(f"Expected exactly five physical lines; got {len(lines)}")
@@ -145,13 +146,14 @@ def parse_derbake(path: str | Path, *, max_beats_per_cycle: int | None = None) -
     if sum(lengths) != len(beats) or len(tempos) != len(beats):
         raise ValueError("Tempo count, cycle lengths, and variation beats disagree")
     events = _parse_skeleton(lines[3].split(), len(beats))
-    # Preserve old notebook behavior: a skeleton hit overrides its variation slot.
+    # Model inputs overlay skeleton hits; audio renders the two streams separately.
     normalized = [list(beat.hits) for beat in beats]
-    for event in events:
-        beat_index = int(event.time_in_beats)
-        slot = int((event.time_in_beats - beat_index) * beats[beat_index].subdivision)
-        slot = min(beats[beat_index].subdivision - 1, max(0, slot))
-        normalized[beat_index][slot] = event.hit
+    if overlay_skeleton:
+        for event in events:
+            beat_index = int(event.time_in_beats)
+            slot = int((event.time_in_beats - beat_index) * beats[beat_index].subdivision)
+            slot = min(beats[beat_index].subdivision - 1, max(0, slot))
+            normalized[beat_index][slot] = event.hit
     normalized_beats = [Beat(beat.subdivision, tuple(hits)) for beat, hits in zip(beats, normalized)]
     cycles = []
     start = 0

@@ -3,12 +3,87 @@
 Extracted from the notebook without changing the attention equations.
 """
 from __future__ import annotations
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from .rhythm_ldm import STRUCTURED_ROUTING_FIELDS, count_hit_atoms, parse_subdivision_token
+
+def configure_cuda_precision(device, *, allow_tf32: bool = True) -> dict:
+    """Set the old notebook's CUDA precision policy explicitly for this process."""
+    if torch.device(device).type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+        torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+    return {"allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+            "matmul_precision": torch.get_float32_matmul_precision()}
+
+
+@contextmanager
+def cuda_precision_policy(device, *, allow_tf32: bool):
+    """Scope precision changes so diagnostics cannot alter later training."""
+    previous = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32,
+                torch.get_float32_matmul_precision())
+    try:
+        yield configure_cuda_precision(device, allow_tf32=allow_tf32)
+    finally:
+        if torch.device(device).type == "cuda":
+            torch.set_float32_matmul_precision(previous[2])
+            torch.backends.cuda.matmul.allow_tf32 = previous[0]
+            torch.backends.cudnn.allow_tf32 = previous[1]
+
+
+def configure_global_flash(core, *, amp: bool = True) -> dict:
+    """Verify a real CUDA forward/backward before forcing global full-sequence SDPA.
+
+    Hardware policy is process-local, never stored in model weights/configuration.
+    Structured masked attention and cached decoding retain automatic dispatch.
+    """
+    blocks = [block for block in core.blocks if hasattr(block, "flash_dtype")]
+    for block in blocks:
+        block.flash_dtype = None
+    device = next(core.parameters()).device
+    report = {"global_policy": "automatic", "verified": False,
+              "device": str(device), "structured_policy": "automatic",
+              "cached_decode_policy": "automatic"}
+    if device.type != "cuda" or not amp or not blocks:
+        report["reason"] = "CPU, AMP disabled, or no global attention layers"
+        print(f"[attention] automatic SDPA: {report['reason']}", flush=True)
+        return report
+    dtype = torch.get_autocast_dtype("cuda")
+    block = blocks[0]
+    report.update(dtype=str(dtype), heads=block.number_heads, head_dim=block.head_dim,
+                  sequence_length=min(128, core.context_size), dropout=block.attention_layer.dropout,
+                  device_name=torch.cuda.get_device_name(device))
+    print(f"[attention] testing Flash forward/backward on {report['device_name']} ({dtype})", flush=True)
+    try:
+        # The probe must not change training randomness or parameter gradients.
+        with torch.random.fork_rng(devices=[device.index if device.index is not None else torch.cuda.current_device()]), torch.inference_mode(False), torch.enable_grad():
+            query = torch.randn(1, block.number_heads, report["sequence_length"], block.head_dim,
+                                device=device, dtype=dtype, requires_grad=True)
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                output = F.scaled_dot_product_attention(query, query, query,
+                    dropout_p=report["dropout"], is_causal=True)
+                output.sum().backward()
+            torch.cuda.synchronize(device)
+            if not torch.isfinite(output).all() or not torch.isfinite(query.grad).all():
+                raise RuntimeError("Flash probe produced non-finite outputs or gradients")
+    except (RuntimeError, NotImplementedError) as error:
+        report["reason"] = str(error)
+        if "A100" in report["device_name"].upper():
+            raise RuntimeError(f"Flash verification failed on A100: {error}") from error
+        print(f"[attention] Flash unavailable; automatic SDPA: {error}", flush=True)
+        return report
+    for block in blocks:
+        block.flash_dtype = dtype
+    report.update(verified=True, global_policy="flash_for_verified_cuda_dtype")
+    print("[attention] Flash forward/backward passed; forcing Flash for compatible global attention", flush=True)
+    return report
+
 
 def build_token_to_id(vocab_list: List[str]) -> Dict[str, int]:
     token_to_id = {tok: i for i, tok in enumerate(vocab_list)}
@@ -208,6 +283,7 @@ class Transformer_Attention_Block(nn.Module):
         self.layer_norm_1 = nn.LayerNorm(number_embeddings)
         self.number_heads = number_heads
         self.head_dim = number_embeddings // number_heads
+        self.flash_dtype = None
         self.attention_layer = nn.MultiheadAttention(
             embed_dim=number_embeddings,
             num_heads=number_heads,
@@ -256,7 +332,11 @@ class Transformer_Attention_Block(nn.Module):
             "dropout_p": self.attention_layer.dropout if self.training else 0.0,
             "is_causal": True,
         }
-        attention = F.scaled_dot_product_attention(query, key, value, **kwargs)
+        if query.is_cuda and self.flash_dtype is not None and query.dtype == self.flash_dtype:
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                attention = F.scaled_dot_product_attention(query, key, value, **kwargs)
+        else:
+            attention = F.scaled_dot_product_attention(query, key, value, **kwargs)
         attention = attention.transpose(1, 2).contiguous().view(
             batch_size, sequence_length, embed_dim
         )
@@ -376,28 +456,23 @@ class Structured_Attention_Block(nn.Module):
         )
         self.last_gate_usage = None
         self.profile_stream_events = False
-        self._pending_stream_events = {}
+        self._stream_events = {}
 
-    def _begin_stream_timer(self, name: str, tensor: torch.Tensor):
-        if not self.profile_stream_events or not tensor.is_cuda:
+    def _begin_stream_timer(self):
+        if not self.profile_stream_events:
             return None
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        return name, start, end
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
 
-    def _finish_stream_timer(self, timer) -> None:
-        if timer is None:
-            return
-        name, start, end = timer
-        end.record()
-        self._pending_stream_events[name] = (start, end)
+    def _finish_stream_timer(self, name, start):
+        if start is not None:
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            self._stream_events[name] = (start, end)
 
-    def profiled_stream_times_ms(self) -> Dict[str, float]:
-        return {
-            name: start.elapsed_time(end)
-            for name, (start, end) in self._pending_stream_events.items()
-        }
+    def profiled_stream_times_ms(self):
+        return {name: start.elapsed_time(end) for name, (start, end) in self._stream_events.items()}
 
     def _project_qkv(self, normalized: torch.Tensor):
         batch_size, sequence_length, _ = normalized.shape
@@ -432,7 +507,7 @@ class Structured_Attention_Block(nn.Module):
         items_per_group: int,
     ):
         """Fixed-shape scatter-add packing; no dynamic Python loops or nonzero()."""
-        batch_size, heads, sequence_length, head_dim = query.shape
+        batch_size, heads, _, head_dim = query.shape
         valid = (
             valid
             & (group_slot >= 0)
@@ -562,11 +637,11 @@ class Structured_Attention_Block(nn.Module):
         )
         dropout_p = self.attention_dropout if self.training else 0.0
         auxiliary = {}
-        self._pending_stream_events = {}
+        self._stream_events = {}
 
         local_context, local_available = zero_context, false_mask
         if self.use_inside_beat_stream:
-            stream_timer = self._begin_stream_timer("inside_beat", query)
+            timer = self._begin_stream_timer()
             local_position = routing["local_beat_position"]
             local_valid = (routing["beat_slot"] >= 0) & (local_position >= 0)
             local_q = self._rotate(query, local_position, rope_inv_freq)
@@ -598,14 +673,14 @@ class Structured_Attention_Block(nn.Module):
                 local_v=packed_v,
                 local_valid=packed_valid,
             )
-            self._finish_stream_timer(stream_timer)
+            self._finish_stream_timer('inside_beat', timer)
 
         beat_context, beat_available = zero_context, false_mask
         beat_table = query.new_zeros(
             batch_size, self.max_beat_slots_per_chunk, self.number_embeddings
         )
         if self.use_beat_memory_stream:
-            stream_timer = self._begin_stream_timer("beat_memory", query)
+            timer = self._begin_stream_timer()
             endpoint_valid = routing["complete_eob_mask"]
             beat_q = self._rotate(query, beat_idx_ids, rope_inv_freq)
             beat_k = self._rotate(key, beat_idx_ids, rope_inv_freq)
@@ -649,14 +724,14 @@ class Structured_Attention_Block(nn.Module):
                 beat_valid=packed_valid,
                 beat_table=beat_table,
             )
-            self._finish_stream_timer(stream_timer)
+            self._finish_stream_timer('beat_memory', timer)
 
         cycle_context, cycle_available = zero_context, false_mask
         cycle_table = query.new_zeros(
             batch_size, self.max_cycles_per_chunk, self.number_embeddings
         )
         if self.use_cycle_memory_stream:
-            stream_timer = self._begin_stream_timer("cycle_memory", query)
+            timer = self._begin_stream_timer()
             endpoint_valid = routing["complete_eoc_mask"]
             cycle_position = routing["cycle_slot"]
             cycle_q = self._rotate(query, cycle_position, rope_inv_freq)
@@ -702,7 +777,7 @@ class Structured_Attention_Block(nn.Module):
                 cycle_valid=packed_valid,
                 cycle_table=cycle_table,
             )
-            self._finish_stream_timer(stream_timer)
+            self._finish_stream_timer('cycle_memory', timer)
 
         auxiliary["beat_table"] = beat_table
         auxiliary["cycle_table"] = cycle_table

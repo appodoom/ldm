@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .experiment_config import RunConfig
+from .dataset_integrity import dataset_fingerprint, verify_dataset
 
 
 def _source_hash(ordinary: Path, decorated: Path | None) -> str:
@@ -46,7 +47,7 @@ def prepare_or_load_dataset(config: RunConfig, ordinary: str | Path,
               "decorated_weight": config.data.decorated_weight if decorated else None,
               "source_hash": _source_hash(ordinary, decorated),
               "vocab_hash": vocabulary_hash(atomic_vocabulary(config.data.variant.value)),
-              "preparation_version": 3, "split_version": "per_file_contiguous_cycles_v1"}
+              "preparation_version": 4, "split_version": "per_file_contiguous_cycles_v1"}
     fingerprint = hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
     target = Path(cache_root) / f"{config.data.variant.value}-{fingerprint[:12]}"
     manifest_path = target / "dataset_manifest.json"
@@ -55,10 +56,7 @@ def prepare_or_load_dataset(config: RunConfig, ordinary: str | Path,
         differences = [key for key, value in recipe.items() if saved.get(key) != value]
         if differences:
             raise ValueError(f"Cached dataset recipe differs: {', '.join(differences)}")
-        for split in ("train", "val", "test"):
-            if any(not (target / f"{split}{suffix}.npy").exists()
-                   for suffix in ("", "_score_mask", "_skeleton_mask", "_source_file")):
-                raise ValueError(f"Cached {split} arrays are incomplete")
+        verify_dataset(target)
         print(f"Using prepared dataset {target}", flush=True)
         return target
     if target.exists() and any(target.iterdir()):
@@ -151,7 +149,10 @@ def _train_kwargs(config: RunConfig) -> dict:
                 seed=t.seed, save_every_steps=t.save_every_steps,
                 log_every_steps=t.log_every_steps, eval_batch_size=e.batch_size,
                 eval_every_steps=e.every_steps, weight_decay=t.weight_decay,
-                grad_clip=t.grad_clip, amp=t.amp, max_steps=t.max_steps,
+                grad_clip=t.grad_clip, amp=t.amp, allow_tf32=t.allow_tf32,
+                num_workers=t.num_workers, pin_memory=t.pin_memory,
+                persistent_workers=t.persistent_workers, prefetch_factor=t.prefetch_factor,
+                max_steps=t.max_steps,
                 max_train_time_minutes=t.max_train_time_minutes,
                 stop_on_nonfinite_loss=t.stop_on_nonfinite_loss,
                 divergence_threshold=t.divergence_threshold,
@@ -193,10 +194,9 @@ def start_run(config: RunConfig, dataset: str | Path, runs_root: str | Path,
                                       "choose another name or use Resume") from exc
             suffix += 1
     dataset = Path(dataset).resolve()
-    manifest_bytes = (dataset / "dataset_manifest.json").read_bytes()
     record = {"run_id": run_dir.name, "status": "created", "config": config.to_dict(),
               "config_fingerprint": config.fingerprint, "dataset_path": str(dataset),
-              "dataset_fingerprint": hashlib.sha256(manifest_bytes).hexdigest(),
+              "dataset_fingerprint": dataset_fingerprint(dataset),
               "code_commit": _code_commit(), "python": platform.python_version(),
               "created_utc": datetime.now(timezone.utc).isoformat()}
     _write_json(run_dir / "experiment.json", record)
@@ -216,7 +216,7 @@ def execute_run(run_dir: str | Path, *, device: str | None = None,
     record = json.loads(path.read_text(encoding="utf-8"))
     config = RunConfig.from_dict(record["config"])
     dataset = Path(record["dataset_path"])
-    if hashlib.sha256((dataset / "dataset_manifest.json").read_bytes()).hexdigest() != record["dataset_fingerprint"]:
+    if dataset_fingerprint(dataset) != record["dataset_fingerprint"]:
         raise ValueError("Prepared dataset fingerprint differs from run record")
     if resume and not (run_dir / "last.pt").exists():
         raise ValueError("No resumable last.pt in this run")
@@ -237,6 +237,7 @@ def execute_run(run_dir: str | Path, *, device: str | None = None,
         record["last_error"] = repr(exc)
         _write_json(path, record)
         raise
+    record.pop("last_error", None)
     record["status"] = result["stop_reason"]
     record["last_step"] = result["steps"]
     record["best_step"] = result["best_step"]
@@ -295,5 +296,6 @@ def compare_runs(run_dirs: list[str | Path]) -> list[dict]:
     versions = {row["metric_version"] for row in rows}
     splits = {row["split_version"] for row in rows}
     for row in rows:
-        row["comparable"] = len(fingerprints) == len(versions) == len(splits) == 1
+        row["comparable"] = (len(fingerprints) == len(versions) == len(splits) == 1
+                             and row['metric_version'] is not None and row['split_version'] is not None)
     return rows

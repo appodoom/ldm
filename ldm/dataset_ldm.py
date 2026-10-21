@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List
 import hashlib
-import json
 import numpy as np
 from .derbake_ldm import RhythmSequence, parse_derbake
 from .schema_ldm import RhythmSchema
@@ -327,7 +326,7 @@ def prepare_dataset(
             skeleton_targets=skeleton_masks[split_name],
             source_file_ids=file_ids[split_name],
         )
-    manifest = {"format_version": 2, "preparation_version": 3,
+    manifest = {"format_version": 2, "preparation_version": 4,
                 "normalization_version": "skeleton_overlay_v1",
                 "split_version": "per_file_contiguous_cycles_v1",
                 "variant": variant, "vocab_hash": vocab.hash,
@@ -337,6 +336,6 @@ def prepare_dataset(
                 "max_beats_per_cycle": max_beats_per_cycle,
                 "source_hash": digest.hexdigest(), "files": split_files, "stats": stats}
     manifest["decorated_weight"] = decorated_weight if decorated else None
-    (output_dir / "dataset_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n",
-                                                       encoding="utf-8")
+    from .dataset_integrity import seal_dataset
+    seal_dataset(output_dir, manifest)
     return manifest

@@ -80,6 +80,11 @@ class TrainConfig:
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     amp: bool = True
+    allow_tf32: bool = True
+    num_workers: int = 2
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 2
     seed: int = 1337
     save_every_steps: int = 200
     log_every_steps: int = 50
@@ -141,6 +146,8 @@ class RunConfig:
                             ("grad_clip", t.grad_clip), ("early_stopping_min_delta", t.early_stopping_min_delta)):
             if not math.isfinite(value) or value < 0 or (name == "learning_rate" and value == 0):
                 raise ValueError(f"Invalid {name}")
+        if not isinstance(t.num_workers, int) or t.num_workers < 0 or not isinstance(t.prefetch_factor, int) or t.prefetch_factor < 1:
+            raise ValueError("Invalid data-loader worker count or prefetch factor")
         if t.early_stopping_patience < 1 or t.early_stopping_warmup_evals < 0:
             raise ValueError("Invalid early stopping settings")
         if t.max_steps is not None and t.max_steps < 1:

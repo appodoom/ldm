@@ -38,7 +38,9 @@ def _train(args):
     result = train(args.dataset, args.run, config, epochs=args.epochs,
                    batch_size=args.batch_size, learning_rate=args.learning_rate,
                    seed=args.seed, save_every_steps=args.save_every_steps,
-                   log_every_steps=args.log_every_steps,
+                   log_every_steps=args.log_every_steps, amp=args.amp, allow_tf32=args.allow_tf32,
+                   num_workers=args.num_workers, pin_memory=args.pin_memory,
+                   persistent_workers=args.persistent_workers, prefetch_factor=args.prefetch_factor,
                    resume=args.resume, device=args.device)
     print(json.dumps(result, indent=2))
 
@@ -105,6 +107,12 @@ def main(argv=None):
     training.add_argument("--seed", type=int, default=1337)
     training.add_argument("--save-every-steps", type=int, default=200)
     training.add_argument("--log-every-steps", type=int, default=50)
+    training.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    training.add_argument("--allow-tf32", action=argparse.BooleanOptionalAction, default=True)
+    training.add_argument("--num-workers", type=int, default=2)
+    training.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
+    training.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    training.add_argument("--prefetch-factor", type=int, default=2)
     training.add_argument("--device")
     training.add_argument("--resume", action="store_true")
     training.set_defaults(handler=_train)

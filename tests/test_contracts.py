@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import tempfile
+import sys
+import types
 import unittest
-import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -19,7 +20,8 @@ from ldm.vocabulary import AtomicVocabulary, atomic_vocabulary
 from ldm.dataset_ldm import prepare_dataset
 from ldm.experiment_config import DataConfig, DatasetVariant, RunConfig
 from ldm.experiment_workflow import check_run_name, make_run_id, prepare_or_load_dataset
-from ldm.review_ldm import InferenceConfig, render_wav
+from ldm.inference_ldm import InferenceConfig
+from ldm.dotderbake import render_wav
 from dataclasses import replace
 
 
@@ -44,21 +46,68 @@ class DerbakeContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
             root = Path(folder)
             rhythm = root / "rhythm.derbake"
-            write_derbake(RhythmSequence(((Beat(1, ("HIT_D_decorated",)),),)), rhythm)
-            folders = {}
-            for name in ("doums", "taks", "tiks", "pa2s"):
-                directory = root / name
-                directory.mkdir()
-                folders[name] = directory
-                with wave.open(str(directory / "sample.wav"), "wb") as handle:
-                    handle.setnchannels(1)
-                    handle.setsampwidth(2)
-                    handle.setframerate(22050)
-                    handle.writeframes(np.array([0, 1000, 0], dtype="<i2").tobytes())
-            output = render_wav(rhythm, folders, root / "preview.wav")
-            with wave.open(str(output), "rb") as handle:
-                self.assertEqual(handle.getframerate(), 22050)
-                self.assertGreater(handle.getnframes(), 3)
+            write_derbake(RhythmSequence(((Beat(2, ("HIT_D_decorated", "HIT_S")),),)), rhythm)
+            lines = rhythm.read_text(encoding="utf-8").splitlines()
+            lines[3] = "DELAY_0.5 HIT_OTA DEV_3"
+            rhythm.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.assertEqual(parse_derbake(rhythm).rhythm.cycles[0][0].hits,
+                             ("HIT_D_decorated", "HIT_OTA"))
+            self.assertEqual(parse_derbake(rhythm, overlay_skeleton=False).rhythm.cycles[0][0].hits,
+                             ("HIT_D_decorated", "HIT_S"))
+            folders = {group: root / group for group in ("normal_hits", "decorated_hits")}
+            for group, names in (("normal_hits", ("doums", "taks", "tiks", "pa2s")),
+                                 ("decorated_hits", ("doums", "taks", "pa2s"))):
+                for name in names:
+                    directory = folders[group] / name
+                    directory.mkdir(parents=True)
+                    (directory / "sample.wav").touch()
+                    (directory / "ignored.flac").touch()
+                    (directory / "ignored.ogg").touch()
+            (folders["decorated_hits"] / "doums" / "alternate.wav").touch()
+            captured = {}
+            def read_sample(path, **kwargs):
+                self.assertEqual(Path(path).suffix.lower(), ".wav")
+                captured.setdefault("chosen_samples", []).append(Path(path))
+                return np.ones(4, dtype=np.float32), 8000
+            def resample(audio, **kwargs):
+                captured["resampled"] = True
+                return np.repeat(audio, 6)
+            def write_sample(path, audio, rate, **kwargs):
+                captured["audio"] = audio.copy()
+                captured["rate"] = rate
+            fake_soundfile = types.SimpleNamespace(read=read_sample, write=write_sample)
+            fake_librosa = types.SimpleNamespace(resample=resample)
+            with patch.dict(sys.modules, {"soundfile": fake_soundfile, "librosa": fake_librosa}):
+                output = render_wav(rhythm, folders, root / "preview.wav", seed=0)
+                first_choice = captured["chosen_samples"][0]
+                render_wav(rhythm, folders, root / "preview.wav", seed=1)
+            self.assertEqual(output, root / "preview.wav")
+            self.assertNotEqual(first_choice, captured["chosen_samples"][2])
+            self.assertEqual(first_choice.parent.parent, folders["decorated_hits"])
+            self.assertEqual(captured["chosen_samples"][1].parent.parent,
+                             folders["normal_hits"])
+            self.assertEqual(captured["rate"], 48000)
+            self.assertTrue(captured["resampled"])
+            self.assertGreater(captured["audio"][5], 0)
+            self.assertGreater(captured["audio"][12008], 0)
+            self.assertEqual(len(captured["audio"]), 24000)
+
+            # Generated files have a blank skeleton line and still need full-length audio.
+            generated = root / "generated.derbake"
+            write_derbake(RhythmSequence(((Beat(1, ("HIT_D",)),),
+                                          (Beat(1, ("HIT_D_decorated",)),))), generated)
+            generated_lines = generated.read_text(encoding="utf-8").splitlines()
+            generated_lines[1] = "120 60"
+            generated.write_text("\n".join(generated_lines) + "\n", encoding="utf-8")
+            with patch.dict(sys.modules, {"soundfile": fake_soundfile, "librosa": fake_librosa}):
+                render_wav(generated, folders, root / "generated.wav", seed=0)
+            self.assertEqual(len(captured["audio"]), 72000)
+            self.assertGreater(captured["audio"][5], 0)
+            self.assertGreater(captured["audio"][24005], 0)
+            self.assertEqual(captured["chosen_samples"][-2].parent.parent,
+                             folders["normal_hits"])
+            self.assertEqual(captured["chosen_samples"][-1].parent.parent,
+                             folders["decorated_hits"])
 
     def test_typed_run_config_round_trip_and_cache_recipe(self):
         config = RunConfig("demo", data=DataConfig(

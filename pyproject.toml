@@ -14,5 +14,9 @@ dependencies = [
   "safetensors>=0.4,<1",
 ]
 
+[project.optional-dependencies]
+audio = ["soundfile", "librosa"]
+analysis = ["matplotlib>=3.8,<4"]
+
 [tool.setuptools.packages.find]
 include = ["ldm*"]
