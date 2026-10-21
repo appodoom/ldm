@@ -13,6 +13,35 @@ METRIC_VERSION = 3
 from .metric_counts import TokenCounts, _ratio
 
 
+def format_percentage(value: float | None) -> str:
+    return "N/A" if value is None else f"{100 * value:.2f}%"
+
+
+def print_evaluation_metrics(report: dict, split: str) -> None:
+    """Print the saved evaluation measures without recalculating any metrics."""
+    metrics = report["combined"]
+
+    names = (("token", "token_accuracy"), ("HIT", "hit_accuracy"),
+             ("structure", "structure_accuracy"), ("hit count", "hit_count_accuracy"),
+             ("skeleton HIT", "skeleton_hit_accuracy"))
+    summary = " | ".join(f"{name} {format_percentage(metrics[key])}" for name, key in names)
+    print(f"{split} loss {metrics['loss']:.4f} | {summary}", flush=True)
+    print(f"{split} structural tokens (accuracy, precision, recall, F1, target count):", flush=True)
+    for token, values in metrics["structure_by_type"].items():
+        print(f"  {token}: accuracy={format_percentage(values['accuracy'])} "
+              f"precision={format_percentage(values['precision'])} recall={format_percentage(values['recall'])} "
+              f"F1={format_percentage(values['f1'])} targets={values['target']}", flush=True)
+    outcomes = metrics["decorated_outcomes"]
+    if outcomes["total"]:
+        print(f"{split} decoration ({outcomes['total']} targets): "
+              f"exact={format_percentage(metrics['decorated_accuracy'])}, "
+              f"wrong type={format_percentage(metrics['decorated_wrong_type_rate'])}, "
+              f"correct plain HIT={format_percentage(metrics['decorated_plain_hit_accuracy'])} | "
+              f"counts: exact={outcomes['exact_decorated']}, "
+              f"wrong type={outcomes['wrong_decorated_type']}, "
+              f"plain HIT={outcomes['correct_plain_hit']}, other={outcomes['other']}", flush=True)
+
+
 @torch.no_grad()
 def evaluate_model(model, dataset, batch_size: int, device: torch.device) -> dict:
     """Evaluate each owned target once; optional old masks produce N/A metrics."""

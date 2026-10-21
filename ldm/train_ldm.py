@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from .configuration_ldm import LDMConfig
-from .evaluation_ldm import evaluate_model
+from .evaluation_ldm import evaluate_model, print_evaluation_metrics
 from .modeling_ldm import LDMModel
 from .data_loading import ChunkDataset, chunk_loader, batch_to_device
 from .dataset_integrity import verify_dataset
@@ -198,13 +198,8 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
             print(f"Saved best checkpoint (validation loss {val_loss:.4f})", flush=True)
         elif eval_events > early_stopping_warmup_evals:
             stale_evals += 1
-        print(f"Validation loss {val_loss:.4f} | accuracy {report['combined']['token_accuracy']:.4f} "
-              f"| best {best:.4f}", flush=True)
-        outcomes = report['combined']['decorated_outcomes']
-        if outcomes['total']:
-            print(f"Decoration outcomes ({outcomes['total']} targets): exact={outcomes['exact_decorated']}, "
-                  f"wrong decorated type={outcomes['wrong_decorated_type']}, "
-                  f"correct plain hit={outcomes['correct_plain_hit']}, other={outcomes['other']}", flush=True)
+        print_evaluation_metrics(report, "Validation")
+        print(f"Best validation loss {best:.4f}", flush=True)
         return bool(early_stopping and stale_evals >= early_stopping_patience)
     print(f"Training {config.dataset_variant} on {device}: "
           f"{len(train_data)} train, {len(val_data)} validation, "
@@ -321,6 +316,7 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
     best_checkpoint = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
     model.load_state_dict(best_checkpoint["model"], strict=True)
     test_report = evaluate_model(model, test_data, eval_batch_size, device)
+    print_evaluation_metrics(test_report, "Test")
     test_loss = test_report["combined"]["loss"]
     result = {"dataset_fingerprint": fingerprint, "best_val_loss": best,
               "best_step": best_step, "test_loss": test_loss, "steps": step,

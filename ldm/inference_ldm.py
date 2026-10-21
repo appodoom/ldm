@@ -22,9 +22,12 @@ class InferenceConfig:
     top_p: float = 1.0
     max_new_tokens: int = 2048
     cache_refresh_tokens: int = 256
+    preview_tokens: int = 120
 
     def __post_init__(self):
         validate_rules({
+            "preview_tokens": (type(self.preview_tokens) is int and self.preview_tokens >= 0,
+                               "must be a nonnegative integer; 0 disables the preview"),
             "num_cycles": (self.num_cycles >= 1, "must be positive"),
             "max_new_tokens": (self.max_new_tokens >= 1, "must be positive"),
             "cache_refresh_tokens": (self.cache_refresh_tokens >= 1, "must be positive"),
@@ -58,6 +61,13 @@ def run_inference(snapshot: str | Path, prompt: str | Path,
                                    top_p=config.top_p, seed=config.seed,
                                    cache_refresh_tokens=config.cache_refresh_tokens,
                                    return_generation_report=True)
+    if config.preview_tokens:
+        ids = generated.continuation_ids[0]
+        count = min(config.preview_tokens, len(ids))
+        atoms = processor.tokenizer.decode_atoms(ids[:count].tolist())
+        suffix = " ..." if count < len(ids) else ""
+        print(f"[inference] Generated-token preview ({count}/{len(ids)} tokens):\n"
+              + " ".join(atoms) + suffix, flush=True)
     print("[inference] Decoding generated tokens into rhythm cycles...", flush=True)
     rhythm = processor.decode_generation(generated.continuation_ids[0],
                                          expected_num_cycles=config.num_cycles)
