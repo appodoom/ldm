@@ -1,6 +1,7 @@
 """Rhythm metadata and structured routing; extracted from the research notebook."""
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple, Union
+from bisect import bisect_left
 import re
 import numpy as np
 try:
@@ -275,18 +276,14 @@ def build_target_ownership_masks_for_sequence(
         if hit_total != expected_hits or event_end >= seq_len or hit_atom_counts[sequence_ids[event_end]]:
             raise ValueError(f"Invalid or incomplete SUBD event at token position {source_position}")
         complete_hit_events += 1
-        hit_token_count = event_end - source_position - 1
-        assigned = False
-        for chunk_row, start in enumerate(chunk_starts):
-            local_position = source_position - start
-            if local_position < 0 or local_position >= context_len:
-                continue
-            if local_position + hit_token_count >= context_len:
-                continue
+        # The first eligible chunk starts at or after event_end-context_len,
+        # and no later than the SUBD token. Preserve the original first-owner
+        # rule without scanning all preceding chunks for every beat.
+        chunk_row = bisect_left(chunk_starts, event_end - context_len)
+        if chunk_row < len(chunk_starts) and chunk_starts[chunk_row] <= source_position:
+            local_position = source_position - chunk_starts[chunk_row]
             hit_count_masks[chunk_row, local_position] = True
-            assigned = True
-            break
-        if not assigned:
+        else:
             raise RuntimeError(
                 "A complete SUBD event does not fit in any evaluation chunk. "
                 "Increase the window size or reduce the maximum subdivision."

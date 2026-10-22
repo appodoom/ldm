@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List
 import hashlib
+from time import perf_counter
 import numpy as np
 from .derbake_ldm import RhythmSequence, parse_derbake
 from .constants import MAX_SUBDIVISION, NORMAL_DATA, DATA_DECORATIONS, PREPARATION_VERSION, NORMALIZATION_RULE, SPLIT_RULE
@@ -164,10 +165,16 @@ def write_split_chunks(
         "max_cycles_per_chunk": 0,
     }
 
+    split_started = perf_counter()
+    print(f"[prepare] {split_name}: writing {total_chunks:,} chunks", flush=True)
     for file_index, (ids, expected_chunks) in enumerate(parsed_files):
         if expected_chunks == 0:
             continue
         seq_len = len(ids)
+        print(f"[prepare] {split_name}: sequence {file_index + 1}/{len(parsed_files)}, "
+              f"{seq_len:,} tokens, {expected_chunks:,} chunks; building metadata", flush=True)
+        source_mask = (np.asarray(skeleton_targets[file_index], dtype=bool)
+                       if skeleton_targets is not None else None)
         sequence_beat_idx, sequence_beat_pos = compute_rhythm_ids_for_sequence(
             ids, rhythm_info, max_beats_per_cycle
         )
@@ -216,12 +223,14 @@ def write_split_chunks(
                 score_mask_arr[row] = file_score_masks[file_row]
                 hit_count_mask_arr[row] = file_hit_count_masks[file_row]
                 if skeleton_mask_arr is not None:
-                    source_mask = np.asarray(skeleton_targets[file_index], dtype=bool)
                     skeleton_window = np.zeros(window_len - 1, dtype=bool)
                     segment = source_mask[start + 1:min(start + window_len, seq_len)]
                     skeleton_window[:len(segment)] = segment
                     skeleton_mask_arr[row] = file_score_masks[file_row] & skeleton_window
             row += 1
+            if row % 500 == 0 or row == total_chunks:
+                print(f"[prepare] {split_name}: {row:,}/{total_chunks:,} chunks "
+                      f"({100 * row / total_chunks:.1f}%), {perf_counter() - split_started:.1f}s", flush=True)
 
     if row != total_chunks:
         raise RuntimeError(
@@ -274,7 +283,11 @@ def prepare_dataset(
     file_ids: dict[str, list[int]] = {"train": [], "val": [], "test": []}
     split_files = []
     digest = hashlib.sha256()
+    preparation_started = perf_counter()
     for source_index, source in enumerate(files):
+        file_started = perf_counter()
+        print(f"[prepare] {variant}: parsing file {source_index + 1}/{len(files)} "
+              f"{source.name} ({source.stat().st_size / 2**20:.1f} MiB)", flush=True)
         document = parse_derbake(source, max_beats_per_cycle=max_beats_per_cycle)
         digest.update(source.name.encode("utf-8"))
         digest.update(hashlib.sha256(source.read_bytes()).digest())
@@ -290,6 +303,9 @@ def prepare_dataset(
             sequences[split_name].append(vocab.encode(atoms))
             skeleton_masks[split_name].append(mask)
             file_ids[split_name].append(source_index)
+        print(f"[prepare] {source.name}: {len(document.rhythm.cycles):,} cycles encoded "
+              f"in {perf_counter() - file_started:.1f}s", flush=True)
+        del document, piece, atoms, mask
     output_dir.mkdir(parents=True, exist_ok=True)
     rhythm_info = build_rhythm_lookup_arrays(list(vocab.tokens), max_beat_positions=MAX_SUBDIVISION)
     stats = {}
@@ -309,5 +325,7 @@ def prepare_dataset(
                 "max_beats_per_cycle": max_beats_per_cycle,
                 "source_hash": digest.hexdigest(), "files": split_files, "stats": stats}
     from .dataset_integrity import seal_dataset
+    print("[prepare] Verifying and hashing prepared arrays...", flush=True)
     seal_dataset(output_dir, manifest)
+    print(f"[prepare] {variant} complete in {perf_counter() - preparation_started:.1f}s", flush=True)
     return manifest
