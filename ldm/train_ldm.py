@@ -15,7 +15,7 @@ import torch
 from .configuration_ldm import LDMConfig
 from .evaluation_ldm import evaluate_model, format_percentage, print_evaluation_metrics
 from .modeling_ldm import LDMModel
-from .data_loading import ChunkDataset, chunk_loader, batch_to_device
+from .data_loading import ChunkDataset, chunk_loader, batch_to_device, evaluation_loader, close_loader
 from .dataset_integrity import verify_dataset
 from .validation import validate_rules
 
@@ -108,9 +108,9 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
                         "max_beats_per_cycle")}
         (run_dir / "dataset_ref.json").write_text(json.dumps(dataset_ref, indent=2) + "\n",
                                                   encoding="utf-8")
-    train_data = ChunkDataset(dataset_dir, "train")
-    val_data = ChunkDataset(dataset_dir, "val")
-    test_data = ChunkDataset(dataset_dir, "test")
+    train_data = ChunkDataset(dataset_dir, "train", model_config=config)
+    val_data = ChunkDataset(dataset_dir, "val", model_config=config, evaluation=True)
+    test_data = ChunkDataset(dataset_dir, "test", model_config=config, evaluation=True)
     if min(len(train_data), len(val_data), len(test_data)) == 0:
         raise ValueError("All three splits need training chunks")
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -179,10 +179,14 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
             "dataset_fingerprint": fingerprint, "epoch": epoch_number, "batch": next_batch,
             "step": step, "best_val_loss": best, "history": history,
             "eval_events": eval_events, "stale_evals": stale_evals, "best_step": best_step})
+    val_loader = evaluation_loader(val_data, eval_batch_size, device, num_workers=num_workers,
+                                   pin_memory=pin_memory, persistent_workers=persistent_workers,
+                                   prefetch_factor=prefetch_factor, seed=seed)
+
     def validate(epoch_number: int) -> bool:
         nonlocal best, eval_events, stale_evals, best_step
         print(f"Validating at step {step}...", flush=True)
-        report = evaluate_model(model, val_data, eval_batch_size, device)
+        report = evaluate_model(model, val_data, eval_batch_size, device, loader=val_loader)
         val_loss = report["combined"]["loss"]
         eval_events += 1
         history.append({"epoch": epoch_number, "step": step, "val_loss": val_loss,
@@ -306,16 +310,19 @@ def train(dataset_dir: str | Path, run_dir: str | Path, config: LDMConfig, *,
             if stop_reason != "completed":
                 break
     finally:
-        # DataLoader has no public close method. Explicit shutdown also covers
-        # exceptions whose traceback still holds the active worker iterator.
-        shutdown = getattr(batch_iterator, "_shutdown_workers", None)
-        if shutdown is not None:
-            shutdown()
+        close_loader(loader, batch_iterator)
+        close_loader(val_loader)
         del loader
     print("Evaluating best checkpoint on test split...", flush=True)
     best_checkpoint = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
     model.load_state_dict(best_checkpoint["model"], strict=True)
-    test_report = evaluate_model(model, test_data, eval_batch_size, device)
+    test_loader = evaluation_loader(test_data, eval_batch_size, device, num_workers=num_workers,
+                                    pin_memory=pin_memory, persistent_workers=False,
+                                    prefetch_factor=prefetch_factor, seed=seed)
+    try:
+        test_report = evaluate_model(model, test_data, eval_batch_size, device, loader=test_loader)
+    finally:
+        close_loader(test_loader)
     print_evaluation_metrics(test_report, "Test")
     test_loss = test_report["combined"]["loss"]
     result = {"dataset_fingerprint": fingerprint, "best_val_loss": best,

@@ -15,18 +15,20 @@ from typing import Iterable
 from .experiment_config import RunConfig
 from .constants import PREPARATION_VERSION
 from .validation import validate_rules
-from .dataset_integrity import dataset_fingerprint, verify_dataset
+from .dataset_integrity import dataset_fingerprint, verify_dataset, _sha256
 
 
-def _source_hash(source_dir: Path) -> str:
+def _source_hash(source_dir: Path) -> tuple[str, dict[str, str]]:
     files = sorted(source_dir.glob("*.derbake"))
     if not files:
         raise ValueError(f"No .derbake files in {source_dir}")
     digest = hashlib.sha256()
+    hashes = {}
     for source in files:
         digest.update(source.name.encode())
-        digest.update(hashlib.sha256(source.read_bytes()).digest())
-    return digest.hexdigest()
+        hashes[source.name] = _sha256(source)
+        digest.update(bytes.fromhex(hashes[source.name]))
+    return digest.hexdigest(), hashes
 
 
 def prepare_or_load_dataset(config: RunConfig, source_dir: str | Path,
@@ -36,10 +38,11 @@ def prepare_or_load_dataset(config: RunConfig, source_dir: str | Path,
     from .vocabulary import atomic_vocabulary, vocabulary_hash
 
     source_dir = Path(source_dir)
+    source_hash, source_hashes = _source_hash(source_dir)
     recipe = {"variant": config.data.variant.value, "decoration": config.data.decoration.value,
               "context_size": config.data.context_size, "stride": config.data.resolved_stride,
               "max_beats_per_cycle": config.data.max_beats_per_cycle,
-              "source_hash": _source_hash(source_dir),
+              "source_hash": source_hash,
               "vocab_hash": vocabulary_hash(atomic_vocabulary(config.data.variant.value)),
               "preparation_version": PREPARATION_VERSION}
     fingerprint = hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
@@ -58,7 +61,8 @@ def prepare_or_load_dataset(config: RunConfig, source_dir: str | Path,
     print(f"Preparing dataset {target}", flush=True)
     prepare_dataset(source_dir, target, variant=config.data.variant.value,
                     decoration=config.data.decoration.value, context_size=config.data.context_size,
-                    max_beats_per_cycle=config.data.max_beats_per_cycle, stride=config.data.resolved_stride)
+                    max_beats_per_cycle=config.data.max_beats_per_cycle, stride=config.data.resolved_stride,
+                    source_hashes=source_hashes)
     return target
 
 

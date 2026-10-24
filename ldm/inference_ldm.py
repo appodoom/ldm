@@ -38,61 +38,78 @@ class InferenceConfig:
         })
 
 
+class InferenceSession:
+    """One loaded snapshot reused across independent prompt/seed attempts."""
+
+    def __init__(self, snapshot: str | Path):
+        import torch
+        from transformers import AutoModel, AutoProcessor
+
+        self.snapshot = Path(snapshot)
+        print(f"[inference] Loading model and processor from {self.snapshot}", flush=True)
+        self.processor = AutoProcessor.from_pretrained(self.snapshot, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(self.snapshot, trust_remote_code=True).eval()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+    def encode_prompt(self, prompt: str | Path):
+        return self.processor(derbake_path=Path(prompt), return_tensors="pt")["input_ids"].to(self.device)
+
+    def run(self, prompt: str | Path, output_root: str | Path, config: InferenceConfig,
+            *, prompt_ids=None) -> dict:
+        import torch
+
+        prompt, output_root = Path(prompt), Path(output_root)
+        prompt_ids = self.encode_prompt(prompt) if prompt_ids is None else prompt_ids
+        print(f"[inference] Prompt: {prompt.name} | {prompt_ids.shape[-1]} tokens | "
+              f"device: {self.device} | seed: {config.seed}", flush=True)
+        print(f"[inference] Generating {config.num_cycles} valid cycles "
+              f"(limit: {config.max_new_tokens} new tokens)...", flush=True)
+        with torch.inference_mode():
+            generated = self.model.generate(prompt_ids, num_cycles=config.num_cycles,
+                                            max_new_tokens=config.max_new_tokens,
+                                            temperature=config.temperature, top_k=config.top_k,
+                                            top_p=config.top_p, seed=config.seed,
+                                            cache_refresh_tokens=config.cache_refresh_tokens,
+                                            return_generation_report=True)
+        if config.preview_tokens:
+            ids = generated.continuation_ids[0]
+            count = min(config.preview_tokens, len(ids))
+            atoms = self.processor.tokenizer.decode_atoms(ids[:count].tolist())
+            suffix = " ..." if count < len(ids) else ""
+            print(f"[inference] Generated-token preview ({count}/{len(ids)} tokens):\n"
+                  + " ".join(atoms) + suffix, flush=True)
+        print("[inference] Decoding generated tokens into rhythm cycles...", flush=True)
+        rhythm = self.processor.decode_generation(generated.continuation_ids[0],
+                                                   expected_num_cycles=config.num_cycles)
+        output_name = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}_{prompt.stem}_s{config.seed}"
+        output_dir = output_root / output_name
+        suffix = 2
+        while output_dir.exists():
+            output_dir = output_root / f"{output_name}_{suffix}"
+            suffix += 1
+        output_dir.mkdir(parents=True)
+        (output_dir / "prompt.derbake").write_bytes(prompt.read_bytes())
+        output_file = output_dir / "generated.derbake"
+        print(f"[inference] Writing five-line .derbake: {len(rhythm.cycles)} cycles, "
+              f"{rhythm.beat_count} beats | cycle lengths: {rhythm.cycle_lengths}", flush=True)
+        self.processor.save_derbake(rhythm, output_file)
+        reloaded_ids = self.processor(derbake_path=output_file, return_tensors="pt")["input_ids"][0]
+        if not torch.equal(reloaded_ids.cpu(), generated.continuation_ids[0].cpu()):
+            raise RuntimeError("Generated file failed token round trip")
+        report = {"snapshot": str(self.snapshot), "prompt": str(prompt),
+                  "config": asdict(config), "generation": generated.report,
+                  "output": str(output_file)}
+        (output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"[inference] Saved and verified: {output_file}", flush=True)
+        print(f"[inference] Generation report: {generated.report}", flush=True)
+        return report
+
+
 def run_inference(snapshot: str | Path, prompt: str | Path,
                   output_root: str | Path, config: InferenceConfig) -> dict:
-    import torch
-    from transformers import AutoModel, AutoProcessor
-
-    snapshot, prompt, output_root = Path(snapshot), Path(prompt), Path(output_root)
-    print(f"[inference] Loading model and processor from {snapshot}", flush=True)
-    processor = AutoProcessor.from_pretrained(snapshot, trust_remote_code=True)
-    model = AutoModel.from_pretrained(snapshot, trust_remote_code=True).eval()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    prompt_ids = processor(derbake_path=prompt, return_tensors="pt")["input_ids"].to(device)
-    print(f"[inference] Prompt: {prompt.name} | {prompt_ids.shape[-1]} tokens | "
-          f"device: {device} | seed: {config.seed}", flush=True)
-    print(f"[inference] Generating {config.num_cycles} valid cycles "
-          f"(limit: {config.max_new_tokens} new tokens)...", flush=True)
-    with torch.inference_mode():
-        generated = model.generate(prompt_ids, num_cycles=config.num_cycles,
-                                   max_new_tokens=config.max_new_tokens,
-                                   temperature=config.temperature, top_k=config.top_k,
-                                   top_p=config.top_p, seed=config.seed,
-                                   cache_refresh_tokens=config.cache_refresh_tokens,
-                                   return_generation_report=True)
-    if config.preview_tokens:
-        ids = generated.continuation_ids[0]
-        count = min(config.preview_tokens, len(ids))
-        atoms = processor.tokenizer.decode_atoms(ids[:count].tolist())
-        suffix = " ..." if count < len(ids) else ""
-        print(f"[inference] Generated-token preview ({count}/{len(ids)} tokens):\n"
-              + " ".join(atoms) + suffix, flush=True)
-    print("[inference] Decoding generated tokens into rhythm cycles...", flush=True)
-    rhythm = processor.decode_generation(generated.continuation_ids[0],
-                                         expected_num_cycles=config.num_cycles)
-    output_name = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}_{prompt.stem}_s{config.seed}"
-    output_dir = output_root / output_name
-    suffix = 2
-    while output_dir.exists():
-        output_dir = output_root / f"{output_name}_{suffix}"
-        suffix += 1
-    output_dir.mkdir(parents=True)
-    (output_dir / "prompt.derbake").write_bytes(prompt.read_bytes())
-    output_file = output_dir / "generated.derbake"
-    print(f"[inference] Writing five-line .derbake: {len(rhythm.cycles)} cycles, "
-          f"{rhythm.beat_count} beats | cycle lengths: {rhythm.cycle_lengths}", flush=True)
-    processor.save_derbake(rhythm, output_file)
-    reloaded_ids = processor(derbake_path=output_file, return_tensors="pt")["input_ids"][0]
-    if not torch.equal(reloaded_ids.cpu(), generated.continuation_ids[0].cpu()):
-        raise RuntimeError("Generated file failed token round trip")
-    report = {"snapshot": str(snapshot), "prompt": str(prompt),
-              "config": asdict(config), "generation": generated.report,
-              "output": str(output_file)}
-    (output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"[inference] Saved and verified: {output_file}", flush=True)
-    print(f"[inference] Generation report: {generated.report}", flush=True)
-    return report
+    """Single-attempt convenience API; loops should reuse an InferenceSession."""
+    return InferenceSession(snapshot).run(prompt, output_root, config)
 
 
 def contextual_projection(snapshot: str | Path, dataset_dir: str | Path,
@@ -110,7 +127,7 @@ def contextual_projection(snapshot: str | Path, dataset_dir: str | Path,
     output_dir.mkdir(parents=True, exist_ok=True)
     model = AutoModel.from_pretrained(snapshot, trust_remote_code=True).eval()
     verify_dataset(dataset_dir, model_config=model.config.to_dict())
-    dataset = ChunkDataset(dataset_dir, split)
+    dataset = ChunkDataset(dataset_dir, split, model_config=model.config)
     hidden, labels = [], []
     captured = []
     hook = model.core.layer_normalization.register_forward_hook(

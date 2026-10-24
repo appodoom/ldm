@@ -117,8 +117,8 @@ class TrainingIntegrationTests(unittest.TestCase):
                     # Exercise the exported code in a fresh process without the source package.
                     import subprocess, sys, inspect, importlib, warnings, os
                     from unittest.mock import patch
-                    from transformers import AutoModel
-                    from ldm.inference_ldm import run_inference, InferenceConfig, contextual_projection
+                    from transformers import AutoModel, AutoProcessor
+                    from ldm.inference_ldm import InferenceSession, InferenceConfig, contextual_projection
                     from ldm.derbake_ldm import parse_derbake
                     isolated_env = {**os.environ, 'TMP': str(root), 'TEMP': str(root)}
                     isolated = subprocess.run([sys.executable, '-I', str(Path(__file__).with_name('hf_snapshot_smoke.py')),
@@ -138,12 +138,23 @@ class TrainingIntegrationTests(unittest.TestCase):
                     sampled = iter(model.vocab.index(atom) for atom in atoms)
                     generation_module = importlib.import_module(model.__class__.__module__)
                     generator = inspect.unwrap(generation_module.generate_continuation_ids)
-                    with patch.object(AutoModel, 'from_pretrained', return_value=model), \
+                    with patch.object(AutoModel, 'from_pretrained', return_value=model) as load_model, \
+                         patch.object(AutoProcessor, 'from_pretrained', wraps=AutoProcessor.from_pretrained) as load_processor, \
                          patch('torch.cuda.is_available', return_value=False), \
                          patch.dict(generator.__globals__, {'sample_next_id': lambda **kwargs: next(sampled)}), \
                          warnings.catch_warnings(record=True) as caught:
-                        report = run_inference(snapshot, prompt, root / 'inference',
-                            InferenceConfig(num_cycles=1, max_new_tokens=128, cache_refresh_tokens=8))
+                        session = InferenceSession(snapshot)
+                        prompt_ids = session.encode_prompt(prompt)
+                        outputs = []
+                        for seed in (1337, 42, 1337):
+                            sampled = iter(model.vocab.index(atom) for atom in atoms)
+                            report = session.run(prompt, root / 'inference',
+                                InferenceConfig(num_cycles=1, seed=seed, max_new_tokens=128,
+                                                cache_refresh_tokens=8), prompt_ids=prompt_ids)
+                            outputs.append(Path(report['output']).read_bytes())
+                        self.assertEqual(outputs[0], outputs[2])
+                        self.assertEqual(load_model.call_count, 1)
+                        self.assertEqual(load_processor.call_count, 1)
                     self.assertEqual(parse_derbake(report['output']).rhythm, expected)
                     self.assertEqual(report['generation']['accepted_cycles'], 1)
                     self.assertEqual(report['generation']['discarded_cycles'], 2)

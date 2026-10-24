@@ -5,7 +5,8 @@ from typing import Dict, List
 import hashlib
 from time import perf_counter
 import numpy as np
-from .derbake_ldm import RhythmSequence, parse_derbake
+from .normalized_data import load_normalized_source
+from .dataset_integrity import _sha256
 from .constants import MAX_SUBDIVISION, NORMAL_DATA, DATA_DECORATIONS, PREPARATION_VERSION, NORMALIZATION_RULE, SPLIT_RULE
 from .schema_ldm import RhythmSchema
 from .vocabulary import AtomicVocabulary, atomic_vocabulary
@@ -16,34 +17,6 @@ from .rhythm_ldm import (STRUCTURED_ROUTING_FIELDS, count_chunks, get_chunk_star
     compute_hierarchy_ids_for_sequence, build_structured_routing_for_window,
     build_target_ownership_masks_for_sequence)
 
-
-def skeleton_atom_mask(document, start_cycle: int, end_cycle: int, variant: str) -> list[bool]:
-    """Mark normalized HIT atoms sourced from line-four skeleton events."""
-    lengths = document.rhythm.cycle_lengths
-    first_beat = sum(lengths[:start_cycle])
-    last_beat = sum(lengths[:end_cycle])
-    event_slots = set()
-    flat_beats = [beat for cycle in document.rhythm.cycles for beat in cycle]
-    for event in document.skeleton_events:
-        beat_index = int(event.time_in_beats)
-        if first_beat <= beat_index < last_beat:
-            beat = flat_beats[beat_index]
-            slot = int((event.time_in_beats - beat_index) * beat.subdivision)
-            event_slots.add((beat_index, min(beat.subdivision - 1, max(0, slot))))
-    mask = []
-    beat_index = first_beat
-    for cycle in document.rhythm.cycles[start_cycle:end_cycle]:
-        mask.append(False)  # <SOC>
-        for beat in cycle:
-            mask.append(False)  # <SOB>
-            if variant == "with_subd":
-                mask.append(False)
-            for slot in range(beat.subdivision):
-                mask.append((beat_index, slot) in event_slots)
-            mask.append(False)  # <EOB>
-            beat_index += 1
-        mask.append(False)  # <EOC>
-    return mask
 
 def write_split_chunks(
     split_name: str,
@@ -264,6 +237,7 @@ def prepare_dataset(
     source_dir: str | Path, output_dir: str | Path, *, variant: str,
     context_size: int, max_beats_per_cycle: int,
     decoration: str = NORMAL_DATA, stride: int | None = None,
+    source_hashes: dict[str, str] | None = None,
 ) -> dict:
     """Prepare one independent source, splitting complete cycles within each file."""
     source_dir = Path(source_dir)
@@ -286,26 +260,29 @@ def prepare_dataset(
     preparation_started = perf_counter()
     for source_index, source in enumerate(files):
         file_started = perf_counter()
-        print(f"[prepare] {variant}: parsing file {source_index + 1}/{len(files)} "
+        print(f"[prepare] {variant}: normalizing/loading file {source_index + 1}/{len(files)} "
               f"{source.name} ({source.stat().st_size / 2**20:.1f} MiB)", flush=True)
-        document = parse_derbake(source, max_beats_per_cycle=max_beats_per_cycle)
+        source_hash = source_hashes[source.name] if source_hashes is not None else _sha256(source)
+        normalized = load_normalized_source(source, output_dir.parent / "normalized", source_hash)
+        if np.any(np.diff(normalized.cycles) > max_beats_per_cycle):
+            raise ValueError("Cycle exceeds model capacity")
         digest.update(source.name.encode("utf-8"))
-        digest.update(hashlib.sha256(source.read_bytes()).digest())
-        ranges = split_cycle_ranges(len(document.rhythm.cycles))
-        split_files.append({"file": source.name, "cycles": len(document.rhythm.cycles),
+        digest.update(bytes.fromhex(source_hash))
+        cycle_count = len(normalized.cycles) - 1
+        ranges = split_cycle_ranges(cycle_count)
+        split_files.append({"file": source.name, "cycles": cycle_count,
                             "ranges": {key: list(value) for key, value in ranges.items()}})
         for split_name, (start, end) in ranges.items():
-            piece = RhythmSequence(document.rhythm.cycles[start:end])
-            atoms = schema.encode(piece)
-            mask = skeleton_atom_mask(document, start, end, variant)
+            atoms = schema.encode_cycles(normalized.iter_cycles(start, end))
+            mask = normalized.atom_mask(start, end, variant)
             if len(mask) != len(atoms):
                 raise RuntimeError("Skeleton provenance differs from encoded atoms")
             sequences[split_name].append(vocab.encode(atoms))
             skeleton_masks[split_name].append(mask)
             file_ids[split_name].append(source_index)
-        print(f"[prepare] {source.name}: {len(document.rhythm.cycles):,} cycles encoded "
+        print(f"[prepare] {source.name}: {cycle_count:,} cycles encoded "
               f"in {perf_counter() - file_started:.1f}s", flush=True)
-        del document, piece, atoms, mask
+        del normalized, atoms, mask
     output_dir.mkdir(parents=True, exist_ok=True)
     rhythm_info = build_rhythm_lookup_arrays(list(vocab.tokens), max_beat_positions=MAX_SUBDIVISION)
     stats = {}

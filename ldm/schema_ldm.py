@@ -19,8 +19,12 @@ class RhythmSchema:
         self.max_beats_per_cycle = max_beats_per_cycle
 
     def encode(self, rhythm: RhythmSequence) -> list[str]:
+        return self.encode_cycles(rhythm.cycles)
+
+    def encode_cycles(self, cycles) -> list[str]:
+        """Encode complete cycles, including a lazy normalized-source iterator."""
         atoms = []
-        for cycle in rhythm.cycles:
+        for cycle in cycles:
             if len(cycle) > self.max_beats_per_cycle:
                 raise ValueError("Cycle exceeds model capacity")
             atoms.append("<SOC>")

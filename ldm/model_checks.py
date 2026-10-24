@@ -180,7 +180,7 @@ def profile_cuda(snapshot: str | Path, dataset_dir: str | Path, output_dir: str 
         model.cuda()
         from .model_core import configure_global_flash
         attention_backend = configure_global_flash(model.core, amp=amp)
-        dataset = ChunkDataset(dataset_dir, 'train')
+        dataset = ChunkDataset(dataset_dir, 'train', model_config=model.config)
         rows = list(range(min(batch_size, len(dataset))))
         if not rows:
             raise ValueError('No training chunks to profile')

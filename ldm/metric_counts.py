@@ -48,45 +48,47 @@ class TokenCounts:
             skeleton: np.ndarray) -> None:
         if not len(targets):
             return
-        correct = targets == predictions
-        self.total += len(targets)
-        self.correct += int(correct.sum())
+        n = len(self.vocab)
+        matrix = np.bincount(targets * n + predictions, minlength=n * n).reshape(n, n)
+        self.add_confusion(matrix)
         self.loss_sum += float(losses.sum())
-        self.targets += np.bincount(targets, minlength=len(self.vocab))
-        self.predictions += np.bincount(predictions, minlength=len(self.vocab))
-        self.true_positives += np.bincount(targets[correct], minlength=len(self.vocab))
-        hit_target, hit_pred = self.hit_ids[targets], self.hit_ids[predictions]
-        self.hit_total += int(hit_target.sum())
-        self.hit_predicted += int(hit_pred.sum())
-        self.hit_correct += int((correct & hit_target).sum())
-        self.hit_presence_tp += int((hit_target & hit_pred).sum())
-        structure = self.structure_ids[targets]
-        self.structure_total += int(structure.sum())
-        self.structure_correct += int((correct & structure).sum())
-        decorated_target = self.decorated_ids[targets]
-        decorated_pred = self.decorated_ids[predictions]
-        self.decorated_total += int(decorated_target.sum())
-        self.decorated_predicted += int(decorated_pred.sum())
-        self.decorated_correct += int((correct & decorated_target).sum())
-        self.decorated_presence_tp += int((decorated_target & decorated_pred).sum())
-        self.decorated_wrong_type += int((decorated_target & decorated_pred & ~correct).sum())
-        plain_correct = decorated_target & (predictions == self.plain_ids[targets])
-        self.decorated_plain_correct += int(plain_correct.sum())
-        for token_id in np.unique(targets[decorated_target]):
-            selected = targets == token_id
-            counts = self.decoration_outcomes.setdefault(self.vocab[token_id],
-                {'total': 0, 'exact_decorated': 0, 'wrong_decorated_type': 0, 'correct_plain_hit': 0, 'other': 0})
-            exact = int((selected & correct).sum())
-            wrong = int((selected & decorated_pred & ~correct).sum())
-            plain = int((selected & plain_correct).sum())
-            total = int(selected.sum())
-            counts['total'] += total
-            counts['exact_decorated'] += exact
-            counts['wrong_decorated_type'] += wrong
-            counts['correct_plain_hit'] += plain
-            counts['other'] += total - exact - wrong - plain
         self.skeleton_total += int(skeleton.sum())
-        self.skeleton_correct += int((correct & skeleton).sum())
+        self.skeleton_correct += int(((targets == predictions) & skeleton).sum())
+
+    def add_confusion(self, matrix: np.ndarray) -> None:
+        """Shared metric definitions for NumPy and device-accumulated counts."""
+        targets, predictions, correct = matrix.sum(1), matrix.sum(0), matrix.diagonal()
+        self.targets += targets
+        self.predictions += predictions
+        self.true_positives += correct
+        self.total += int(targets.sum())
+        self.correct += int(correct.sum())
+        for name, selected in (("hit", self.hit_ids), ("structure", self.structure_ids),
+                               ("decorated", self.decorated_ids)):
+            setattr(self, name + "_total", getattr(self, name + "_total") + int(targets[selected].sum()))
+            setattr(self, name + "_correct", getattr(self, name + "_correct") + int(correct[selected].sum()))
+        for name, selected in (("hit", self.hit_ids), ("decorated", self.decorated_ids)):
+            setattr(self, name + "_predicted", getattr(self, name + "_predicted") + int(predictions[selected].sum()))
+            setattr(self, name + "_presence_tp", getattr(self, name + "_presence_tp") +
+                    int(matrix[np.ix_(selected, selected)].sum()))
+        wrong_total = plain_total = 0
+        for token_id in np.flatnonzero(self.decorated_ids):
+            total = int(targets[token_id])
+            if not total:
+                continue
+            exact = int(correct[token_id])
+            wrong = int(matrix[token_id, self.decorated_ids].sum()) - exact
+            plain_id = self.plain_ids[token_id]
+            plain = int(matrix[token_id, plain_id]) if plain_id >= 0 else 0
+            values = {"total": total, "exact_decorated": exact, "wrong_decorated_type": wrong,
+                      "correct_plain_hit": plain, "other": total - exact - wrong - plain}
+            saved = self.decoration_outcomes.setdefault(self.vocab[token_id], dict.fromkeys(values, 0))
+            for key, value in values.items():
+                saved[key] += value
+            wrong_total += wrong
+            plain_total += plain
+        self.decorated_wrong_type += wrong_total
+        self.decorated_plain_correct += plain_total
 
     def result(self) -> dict:
         per_token = {}
